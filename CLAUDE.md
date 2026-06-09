@@ -65,7 +65,8 @@ lock の差分も同じ PR に含める。
 
 - CI (`.github/workflows/ci.yml`) は `ippoan/ci-workflows` の `rust-ci.yml`
   (fmt/clippy/test/build) + `build-image` (musl + scratch + GHCR push) +
-  `deploy-staging` (`cloud-run-deploy.yml`、WIF) で構成。
+  `deploy-staging` (`cloud-run-deploy.yml`、WIF) + `auto-merge`
+  (`auto-merge.yml`、全 job green 後に squash auto-merge を queue) で構成。
 - `deploy-staging` は repo variable `STAGING_DEPLOY_ENABLED=true` まで skip
   (one-time GCP setup の手順は README 参照)。
 - `coverage_100.toml` を repo root に置くと rust-ci の 100% gate が自動で有効化される。

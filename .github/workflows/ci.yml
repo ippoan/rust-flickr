@@ -153,3 +153,29 @@ jobs:
       ar_repo: asia-northeast1-docker.pkg.dev/cloudsql-sv/ghcr/ippoan/rust-flickr
       workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
       service_account: ${{ vars.GCP_WIF_SERVICE_ACCOUNT_STAGING }}
+
+  # 全 CI job が success / skipped した時だけ auto-merge を enable する
+  # (release-wave-gcp と同 pattern)。`needs:` が success 評価された時点で
+  # 「全 CI green が確定」しているため、required check 未設定でも CI fail 中の
+  # 誤 merge は起きない。deploy-staging は vars 未設定時 skip なので
+  # `|| skipped` も許容する。
+  auto-merge:
+    name: Auto Merge
+    needs: [ci, build-image, deploy-staging]
+    if: >-
+      always() &&
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.draft == false &&
+      needs.ci.result == 'success' &&
+      (needs.build-image.result == 'success' || needs.build-image.result == 'skipped') &&
+      (needs.deploy-staging.result == 'success' || needs.deploy-staging.result == 'skipped')
+    uses: ippoan/ci-workflows/.github/workflows/auto-merge.yml@main
+    permissions:
+      contents: write
+      pull-requests: write
+    # auto-merge.yml は CI_APP_ID / CI_APP_PRIVATE_KEY (org secret, GitHub App)
+    # で installation token を mint する (github.token fallback は撤去済 =
+    # ci-workflows#65)。least-privilege: 必要な 2 secret だけ named で渡す。
+    secrets:
+      CI_APP_ID: ${{ secrets.CI_APP_ID }}
+      CI_APP_PRIVATE_KEY: ${{ secrets.CI_APP_PRIVATE_KEY }}
