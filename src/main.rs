@@ -1,17 +1,45 @@
-use axum::{routing::get, Json, Router};
+mod db;
+mod error;
+mod flickr;
+mod oauth1;
+mod routes;
+mod types;
+
+use flickr::{FlickrClient, FlickrConfig};
+use routes::AppState;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-fn app() -> Router {
-    Router::new().route("/healthz", get(healthz))
-}
+/// env から AppState を構築する。
+/// FLICKR_* / DATABASE_URL は **boot 時 optional** (secrets-inventory-gcp と同方式):
+/// 未設定でも起動は成功し、該当 endpoint だけが 503 "not configured" を返す。
+/// /healthz は常に動く = secret 配線 (PR5) 前でも deploy が落ちない。
+fn state_from_env() -> AppState {
+    let flickr = match FlickrConfig::from_env() {
+        Some(config) => Some(FlickrClient::new(config)),
+        None => {
+            tracing::warn!(
+                "FLICKR_CONSUMER_KEY/FLICKR_CONSUMER_SECRET not set — /oauth/* will return 503"
+            );
+            None
+        }
+    };
 
-async fn healthz() -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "status": "ok",
-        "service": "rust-flickr",
-        "version": VERSION,
-    }))
+    let pool = match std::env::var("DATABASE_URL") {
+        Ok(url) if !url.is_empty() => match db::lazy_pool(&url) {
+            Ok(pool) => Some(pool),
+            Err(e) => {
+                tracing::error!("invalid DATABASE_URL (pool not created): {e}");
+                None
+            }
+        },
+        _ => {
+            tracing::warn!("DATABASE_URL not set — DB-backed endpoints will return 503");
+            None
+        }
+    };
+
+    AppState { pool, flickr }
 }
 
 #[tokio::main]
@@ -21,52 +49,33 @@ async fn main() {
         println!("rust-flickr {VERSION} — Flickr REST service (axum)");
         println!();
         println!("env:");
-        println!("  PORT  listen port (default: 8080, Cloud Run が注入)");
+        println!("  PORT                    listen port (default: 8080, Cloud Run が注入)");
+        println!("  FLICKR_CONSUMER_KEY     Flickr OAuth consumer key");
+        println!("  FLICKR_CONSUMER_SECRET  Flickr OAuth consumer secret");
+        println!("  FLICKR_CALLBACK_URL     OAuth callback URL");
+        println!("  DATABASE_URL            Supabase PostgreSQL (rust-logi と共有)");
         return;
     }
+
+    tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_target(false)
+        .init();
 
     let port: u16 = std::env::var("PORT")
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(8080);
 
+    let state = state_from_env();
+
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
         .await
         .unwrap_or_else(|e| panic!("failed to bind 0.0.0.0:{port}: {e}"));
 
-    println!("rust-flickr {VERSION} listening on 0.0.0.0:{port}");
+    tracing::info!("rust-flickr {VERSION} listening on 0.0.0.0:{port}");
 
-    axum::serve(listener, app()).await.expect("server error");
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use axum::body::Body;
-    use axum::http::{Request, StatusCode};
-    use tower::ServiceExt;
-
-    #[tokio::test]
-    async fn healthz_returns_ok() {
-        let res = app()
-            .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-
-        let body = axum::body::to_bytes(res.into_body(), 1024).await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v["status"], "ok");
-        assert_eq!(v["service"], "rust-flickr");
-        assert_eq!(v["version"], VERSION);
-    }
-
-    #[tokio::test]
-    async fn unknown_path_returns_404() {
-        let res = app()
-            .oneshot(Request::get("/nope").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::NOT_FOUND);
-    }
+    axum::serve(listener, routes::app(state))
+        .await
+        .expect("server error");
 }

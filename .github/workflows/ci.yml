@@ -53,6 +53,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
 
       - name: Build (musl static)
+        env:
+          # ring (rustls の C 部分) のクロスビルドに musl-gcc を明示
+          CC_x86_64_unknown_linux_musl: musl-gcc
         run: cargo build --release --target x86_64-unknown-linux-musl --locked
 
       - run: sccache --show-stats

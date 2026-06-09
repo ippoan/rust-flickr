@@ -21,9 +21,24 @@ Cloud Run で稼働し、**scratch 極小イメージ** (musl static + rustls) �
 | Method | Path | 状態 | 説明 |
 | --- | --- | --- | --- |
 | GET | `/healthz` | ✅ PR1 | 死活。`{status, service, version}` を返す |
-| GET | `/oauth/url` | ⏳ PR2 | OAuth1.0a request token 取得 → 認可 URL 返却 |
-| POST | `/oauth/callback` | ⏳ PR2 | verifier → access token 交換 + `flickr_tokens` UPSERT |
+| GET | `/oauth/url` | ✅ PR2 | OAuth1.0a request token 取得 → 認可 URL 返却 |
+| POST | `/oauth/callback` | ✅ PR2 | verifier → access token 交換 + `flickr_tokens` UPSERT。token はレスポンスに echo しない (`{user_nsid, username, saved}`) |
 | POST | `/import` | ⏳ PR3 | 未検証 `cam_files.flickr_id` を検証して `flickr_photo` 登録 |
+
+`/oauth/*` は `X-Organization-Id` ヘッダ (organization UUID) が**必須** —
+欠落/非 UUID は 400。デフォルト org への暗黙フォールバックは置かない (Refs #1)。
+
+### 環境変数
+
+| env | 必須 | 説明 |
+| --- | --- | --- |
+| `PORT` | - | listen port (default 8080、Cloud Run が注入) |
+| `FLICKR_CONSUMER_KEY` / `FLICKR_CONSUMER_SECRET` | boot 時 optional | 未設定なら `/oauth/*` が 503 を返す (PR5 で Secret Manager 配線) |
+| `FLICKR_CALLBACK_URL` | - | OAuth callback URL |
+| `DATABASE_URL` | boot 時 optional | rust-logi と共有の Supabase。未設定なら DB 系 endpoint が 503 |
+
+DB スキーマ (`flickr_tokens` / `flickr_oauth_sessions` / `flickr_photo`) と RLS 関数は
+**rust-logi の migration が所有** (案A: 同一 DB 共有)。本 repo は migration を持たない。
 
 設計原則 (Refs #1):
 
