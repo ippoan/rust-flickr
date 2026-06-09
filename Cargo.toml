@@ -18,6 +18,8 @@ sha1 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
 tracing = "0.1"
+# Rust struct -> TypeScript 型生成 (PR4, Refs #1)。export は cargo test 時のみ
+ts-rs = { version = "12", features = ["serde-compat"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 uuid = { version = "1", features = ["v4"] }
 

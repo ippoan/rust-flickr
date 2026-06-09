@@ -92,8 +92,17 @@ Job Summary に記録する。
 | job | 内容 |
 | --- | --- |
 | `ci / fmt,clippy,test,build` | `ippoan/ci-workflows` の `rust-ci.yml` reusable |
+| `ts-bindings` | ts-rs 生成の `bindings/*.ts` が `src/types.rs` と一致するか (型ドリフト gate) |
 | `build-image` | musl static build → `FROM scratch` packaging → GHCR push (`ghcr.io/ippoan/rust-flickr`) |
 | `deploy-staging` | `cloud-run-deploy.yml` reusable で `rust-flickr-staging` へ digest-pinned deploy (WIF auth) |
+| `auto-merge` | 全 job green 後に squash auto-merge を queue |
+
+### TypeScript 型 (ts-rs)
+
+`src/types.rs` の API req/res struct が SoT。`cargo test export_bindings` で
+`bindings/*.ts` に TypeScript 型が生成される (commit 対象、CI が drift を gate)。
+front は [`clients/ts/client.ts`](./clients/ts/client.ts) (typed fetch ラッパ) と
+`bindings/` をコピー or 参照して使う。
 
 `deploy-staging` は repo variable **`STAGING_DEPLOY_ENABLED=true`** を設定するまで
 skip される。下記 one-time setup 完了後に variable を入れた瞬間 deploy が動き始める。

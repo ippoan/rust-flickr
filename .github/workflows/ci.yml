@@ -18,6 +18,38 @@ jobs:
       binary_name: rust-flickr
       shared_key: rust-flickr
 
+  # ts-rs が生成する bindings/*.ts が最新の Rust struct と一致していることを gate
+  # (型ドリフト検出、Refs #1)。cargo test 時に ts-rs が bindings/ を再生成するので
+  # working tree に差分 / untracked が出たら fail。
+  ts-bindings:
+    name: ts-rs bindings drift check
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-flickr
+          cache-targets: false
+      - name: Regenerate bindings (ts-rs export tests)
+        run: cargo test export_bindings --locked
+      - name: Fail on drift
+        run: |
+          set -euo pipefail
+          STATUS=$(git status --porcelain bindings/)
+          if [ -n "$STATUS" ]; then
+            echo "$STATUS"
+            git diff bindings/ || true
+            echo "::error::bindings/ が src/types.rs と乖離しています。ローカルで 'cargo test export_bindings' を実行して bindings/ を commit してください"
+            exit 1
+          fi
+          echo "bindings/ up to date"
+
   # musl static binary を CI ランナー側でビルド (sccache + rust-cache が効く) し、
   # packaging-only Dockerfile (FROM scratch + COPY) で GHCR に push する。
   # rust-alc-api の「runner で build → Docker は COPY だけ」方式 (Refs #1)。
@@ -164,12 +196,13 @@ jobs:
   # `|| skipped` も許容する。
   auto-merge:
     name: Auto Merge
-    needs: [ci, build-image, deploy-staging]
+    needs: [ci, ts-bindings, build-image, deploy-staging]
     if: >-
       always() &&
       github.event_name == 'pull_request' &&
       github.event.pull_request.draft == false &&
       needs.ci.result == 'success' &&
+      needs.ts-bindings.result == 'success' &&
       (needs.build-image.result == 'success' || needs.build-image.result == 'skipped') &&
       (needs.deploy-staging.result == 'success' || needs.deploy-staging.result == 'skipped')
     uses: ippoan/ci-workflows/.github/workflows/auto-merge.yml@main
