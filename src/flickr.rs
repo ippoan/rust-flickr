@@ -12,6 +12,7 @@ use crate::oauth1;
 const REQUEST_TOKEN_URL: &str = "https://www.flickr.com/services/oauth/request_token";
 const ACCESS_TOKEN_URL: &str = "https://www.flickr.com/services/oauth/access_token";
 const AUTHORIZE_URL: &str = "https://www.flickr.com/services/oauth/authorize";
+const REST_URL: &str = "https://www.flickr.com/services/rest/";
 
 /// Flickr OAuth 1.0a 設定 (env から)
 #[derive(Clone)]
@@ -50,6 +51,20 @@ pub struct AccessToken {
     pub username: String,
 }
 
+/// flickr.photos.getInfo の必要フィールド
+#[derive(serde::Deserialize)]
+pub struct PhotoInfo {
+    pub id: String,
+    pub server: String,
+    pub secret: String,
+}
+
+#[derive(serde::Deserialize)]
+struct GetInfoResponse {
+    photo: Option<PhotoInfo>,
+    stat: String,
+}
+
 #[derive(Clone)]
 pub struct FlickrClient {
     http: reqwest::Client,
@@ -57,6 +72,7 @@ pub struct FlickrClient {
     request_token_url: String,
     access_token_url: String,
     authorize_url: String,
+    rest_url: String,
 }
 
 impl FlickrClient {
@@ -66,6 +82,7 @@ impl FlickrClient {
             REQUEST_TOKEN_URL.to_string(),
             ACCESS_TOKEN_URL.to_string(),
             AUTHORIZE_URL.to_string(),
+            REST_URL.to_string(),
         )
     }
 
@@ -74,6 +91,7 @@ impl FlickrClient {
         request_token_url: String,
         access_token_url: String,
         authorize_url: String,
+        rest_url: String,
     ) -> Self {
         Self {
             http: reqwest::Client::new(),
@@ -81,6 +99,7 @@ impl FlickrClient {
             request_token_url,
             access_token_url,
             authorize_url,
+            rest_url,
         }
     }
 
@@ -202,6 +221,87 @@ impl FlickrClient {
             username: form.get("username").cloned().unwrap_or_default(),
         })
     }
+
+    /// flickr.photos.getInfo を OAuth 署名付きで呼ぶ。
+    /// /import のループ用 — 失敗は呼び出し側で集計するため String エラーで返す
+    /// (rust-logi `call_flickr_get_info` の移植)。
+    pub async fn photos_get_info(
+        &self,
+        photo_id: &str,
+        access_token: &str,
+        access_token_secret: &str,
+    ) -> Result<PhotoInfo, String> {
+        let mut params = self.oauth_base_params();
+        params.insert("oauth_token".to_string(), access_token.to_string());
+        params.insert("method".to_string(), "flickr.photos.getInfo".to_string());
+        params.insert("photo_id".to_string(), photo_id.to_string());
+        params.insert("format".to_string(), "json".to_string());
+        params.insert("nojsoncallback".to_string(), "1".to_string());
+
+        let signature = oauth1::sign(
+            "GET",
+            &self.rest_url,
+            &params,
+            &self.config.consumer_secret,
+            Some(access_token_secret),
+        );
+        params.insert("oauth_signature".to_string(), signature);
+
+        // OAuth パラメータは Authorization ヘッダへ、API パラメータはクエリへ分離
+        let oauth_keys = [
+            "oauth_consumer_key",
+            "oauth_nonce",
+            "oauth_signature_method",
+            "oauth_timestamp",
+            "oauth_token",
+            "oauth_version",
+            "oauth_signature",
+        ];
+        let oauth_params: HashMap<String, String> = params
+            .iter()
+            .filter(|(k, _)| oauth_keys.contains(&k.as_str()))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let auth_header = oauth1::auth_header(&oauth_params);
+        let query_params: Vec<(&str, &str)> = params
+            .iter()
+            .filter(|(k, _)| !oauth_keys.contains(&k.as_str()))
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+
+        let response = self
+            .http
+            .get(&self.rest_url)
+            .header("Authorization", format!("OAuth {auth_header}"))
+            .query(&query_params)
+            .send()
+            .await
+            .map_err(|e| format!("HTTP request failed for photo {photo_id}: {e}"))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!(
+                "Flickr API error for photo {photo_id}: {status} - {body}"
+            ));
+        }
+
+        let api_response: GetInfoResponse = response
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse Flickr response for photo {photo_id}: {e}"))?;
+
+        if api_response.stat != "ok" {
+            return Err(format!(
+                "Flickr API returned stat={} for photo {photo_id}",
+                api_response.stat
+            ));
+        }
+
+        api_response
+            .photo
+            .ok_or_else(|| format!("No photo data in Flickr response for photo {photo_id}"))
+    }
 }
 
 #[cfg(test)]
@@ -224,6 +324,7 @@ mod tests {
             format!("{}/request_token", server.uri()),
             format!("{}/access_token", server.uri()),
             format!("{}/authorize", server.uri()),
+            format!("{}/rest/", server.uri()),
         )
     }
 
@@ -242,6 +343,7 @@ mod tests {
         assert_eq!(c.request_token_url, REQUEST_TOKEN_URL);
         assert_eq!(c.access_token_url, ACCESS_TOKEN_URL);
         assert_eq!(c.authorize_url, AUTHORIZE_URL);
+        assert_eq!(c.rest_url, REST_URL);
     }
 
     #[tokio::test]
@@ -323,6 +425,7 @@ mod tests {
             "http://127.0.0.1:1/request_token".to_string(),
             "http://127.0.0.1:1/access_token".to_string(),
             "http://127.0.0.1:1/authorize".to_string(),
+            "http://127.0.0.1:1/rest/".to_string(),
         );
         let err = client
             .get_request_token()
@@ -394,5 +497,93 @@ mod tests {
             .err()
             .expect("expected error");
         assert!(matches!(err, ApiError::Upstream(m) if m.contains("token_expired")));
+    }
+
+    #[tokio::test]
+    async fn photos_get_info_success_and_query_split() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "photo": {"id": "5050", "server": "65535", "secret": "abc123"},
+                "stat": "ok"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let photo = client_for(&server)
+            .photos_get_info("5050", "at", "ats")
+            .await
+            .unwrap();
+        assert_eq!(photo.id, "5050");
+        assert_eq!(photo.server, "65535");
+        assert_eq!(photo.secret, "abc123");
+
+        // API パラメータはクエリ、OAuth パラメータはヘッダに分離されている
+        let received = &server.received_requests().await.unwrap()[0];
+        let query = received.url.query().unwrap();
+        assert!(query.contains("method=flickr.photos.getInfo"));
+        assert!(query.contains("photo_id=5050"));
+        assert!(query.contains("nojsoncallback=1"));
+        assert!(!query.contains("oauth_signature"));
+        let auth = auth_header_of(received);
+        assert!(auth.contains("oauth_token=\"at\""));
+        assert!(auth.contains("oauth_signature=\""));
+        assert!(!auth.contains("photo_id"));
+    }
+
+    #[tokio::test]
+    async fn photos_get_info_stat_fail() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "stat": "fail", "code": 1, "message": "Photo not found"
+            })))
+            .mount(&server)
+            .await;
+
+        let err = client_for(&server)
+            .photos_get_info("404404", "at", "ats")
+            .await
+            .err()
+            .expect("expected error");
+        assert!(err.contains("stat=fail"));
+        assert!(err.contains("404404"));
+    }
+
+    #[tokio::test]
+    async fn photos_get_info_http_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("oops"))
+            .mount(&server)
+            .await;
+
+        let err = client_for(&server)
+            .photos_get_info("1", "at", "ats")
+            .await
+            .err()
+            .expect("expected error");
+        assert!(err.contains("500"));
+    }
+
+    #[tokio::test]
+    async fn photos_get_info_parse_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/rest/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+            .mount(&server)
+            .await;
+
+        let err = client_for(&server)
+            .photos_get_info("1", "at", "ats")
+            .await
+            .err()
+            .expect("expected error");
+        assert!(err.contains("parse"));
     }
 }

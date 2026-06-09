@@ -88,3 +88,80 @@ pub async fn delete_oauth_session(conn: &mut PgConnection, request_token: &str) 
         .execute(conn)
         .await;
 }
+
+/// flickr_tokens の access token (RLS で現 org の行だけ見える)
+pub struct FlickrTokenRow {
+    pub access_token: String,
+    pub access_token_secret: String,
+}
+
+/// 現 org の access token を取得 (無ければ None = 呼び出し側で 412)
+pub async fn get_flickr_token(conn: &mut PgConnection) -> Result<Option<FlickrTokenRow>, ApiError> {
+    let row: Option<(String, String)> =
+        sqlx::query_as("SELECT access_token, access_token_secret FROM flickr_tokens LIMIT 1")
+            .fetch_optional(conn)
+            .await?;
+    Ok(
+        row.map(|(access_token, access_token_secret)| FlickrTokenRow {
+            access_token,
+            access_token_secret,
+        }),
+    )
+}
+
+/// 未検証の cam_files.flickr_id を最大 limit 件取得
+pub async fn list_unverified_flickr_ids(
+    conn: &mut PgConnection,
+    limit: i64,
+) -> Result<Vec<String>, ApiError> {
+    let rows: Vec<(String,)> = sqlx::query_as(
+        r#"
+        SELECT cf.flickr_id
+        FROM cam_files cf
+        LEFT JOIN flickr_photo fp ON cf.flickr_id = fp.id AND cf.organization_id = fp.organization_id
+        WHERE cf.flickr_id IS NOT NULL AND fp.id IS NULL
+        LIMIT $1
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(conn)
+    .await?;
+    Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
+/// 検証済み写真を flickr_photo に登録 (冪等: ON CONFLICT DO NOTHING)
+pub async fn insert_flickr_photo(
+    conn: &mut PgConnection,
+    organization_id: &str,
+    photo: &crate::flickr::PhotoInfo,
+) -> Result<(), ApiError> {
+    sqlx::query(
+        r#"
+        INSERT INTO flickr_photo (id, organization_id, secret, server)
+        VALUES ($1, $2::uuid, $3, $4)
+        ON CONFLICT (organization_id, id) DO NOTHING
+        "#,
+    )
+    .bind(&photo.id)
+    .bind(organization_id)
+    .bind(&photo.secret)
+    .bind(&photo.server)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+/// 未検証の残数
+pub async fn count_unverified(conn: &mut PgConnection) -> Result<i64, ApiError> {
+    let (count,): (i64,) = sqlx::query_as(
+        r#"
+        SELECT COUNT(*)
+        FROM cam_files cf
+        LEFT JOIN flickr_photo fp ON cf.flickr_id = fp.id AND cf.organization_id = fp.organization_id
+        WHERE cf.flickr_id IS NOT NULL AND fp.id IS NULL
+        "#,
+    )
+    .fetch_one(conn)
+    .await?;
+    Ok(count)
+}
