@@ -188,6 +188,12 @@ jobs:
       ar_repo: asia-northeast1-docker.pkg.dev/cloudsql-sv/ghcr/ippoan/rust-flickr
       workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
       service_account: ${{ vars.GCP_WIF_SERVICE_ACCOUNT_STAGING }}
+      # 値は Secret Manager 参照 (secretKeyRef) で注入 — workflow / log を経由しない。
+      # Secret 本体の投入は user の one-time setup (README「Secrets」参照)。
+      # 未投入のまま deploy すると revision が起動失敗するため、投入完了までは
+      # この 2 行を有効化しつつ secret が存在することが前提になる。
+      update_secrets: FLICKR_CONSUMER_KEY=rust-flickr-consumer-key:latest,FLICKR_CONSUMER_SECRET=rust-flickr-consumer-secret:latest,DATABASE_URL=rust-flickr-database-url:latest
+      set_env_vars: FLICKR_CALLBACK_URL=https://test.mtamaramu.com/flickr/callback
 
   # 全 CI job が success / skipped した時だけ auto-merge を enable する
   # (release-wave-gcp と同 pattern)。`needs:` が success 評価された時点で
