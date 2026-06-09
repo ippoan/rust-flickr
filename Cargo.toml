@@ -7,11 +7,23 @@ publish = false
 
 [dependencies]
 axum = "0.8"
+base64 = "0.22"
+# OAuth 1.0a HMAC-SHA1 は pure Rust の hmac + sha1 で署名 (ring 非依存 = musl static が単純)
+hmac = "0.12"
+# rustls 統一 (openssl 禁止)。webpki-roots 同梱 = scratch に CA store 不要
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha1 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+wiremock = "0.6"
 
 # scratch 極小イメージ向けのサイズ最適化 (Refs #1)
 [profile.release]
