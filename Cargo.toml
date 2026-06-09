@@ -1,0 +1,21 @@
+[package]
+name = "rust-flickr"
+version = "0.1.0"
+edition = "2021"
+description = "Flickr REST service (axum) — rust-logi の gRPC FlickrService からの切り出し"
+publish = false
+
+[dependencies]
+axum = "0.8"
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+
+# scratch 極小イメージ向けのサイズ最適化 (Refs #1)
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+opt-level = "z"

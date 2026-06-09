@@ -1,0 +1,16 @@
+# build artifacts
+/target/
+/ctx/
+
+# secrets
+.env
+*.pem
+*.key
+
+# editor / tooling
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
