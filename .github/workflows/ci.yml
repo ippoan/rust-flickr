@@ -1,0 +1,181 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+jobs:
+  # fmt / clippy / test / build (+ coverage_100.toml があれば 100% gate)
+  ci:
+    uses: ippoan/ci-workflows/.github/workflows/rust-ci.yml@main
+    with:
+      binary_name: rust-flickr
+      shared_key: rust-flickr
+
+  # musl static binary を CI ランナー側でビルド (sccache + rust-cache が効く) し、
+  # packaging-only Dockerfile (FROM scratch + COPY) で GHCR に push する。
+  # rust-alc-api の「runner で build → Docker は COPY だけ」方式 (Refs #1)。
+  build-image:
+    name: Build image (musl + scratch)
+    needs: [ci]
+    if: github.event_name == 'pull_request' && github.event.pull_request.draft != true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      CARGO_TERM_COLOR: always
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - uses: mozilla-actions/sccache-action@v0.0.9
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-flickr-musl
+          cache-targets: false
+
+      - name: Install musl-tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+
+      - name: Build (musl static)
+        run: cargo build --release --target x86_64-unknown-linux-musl --locked
+
+      - run: sccache --show-stats
+
+      - name: Verify static link + report binary size
+        run: |
+          set -euo pipefail
+          BIN=target/x86_64-unknown-linux-musl/release/rust-flickr
+          file "$BIN"
+          # scratch では動的リンクは即死するので static であることを gate する
+          if ! file "$BIN" | grep -qE 'static(ally linked|-pie linked)'; then
+            echo "::error::binary is not statically linked (scratch では起動不能)"
+            exit 1
+          fi
+          SIZE=$(stat -c %s "$BIN")
+          {
+            echo "### Binary size (musl static, stripped)"
+            echo ""
+            echo "| Item | Value |"
+            echo "|------|-------|"
+            echo "| size | $(numfmt --to=iec "$SIZE") ($SIZE bytes) |"
+            echo "| file | \`$(file -b "$BIN")\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - id: meta
+        run: echo "tag=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare Docker context
+        run: |
+          mkdir -p ctx
+          cp target/x86_64-unknown-linux-musl/release/rust-flickr ctx/
+          cp Dockerfile ctx/
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: ctx
+          push: true
+          # provenance attestation を切って plain manifest にする (image size 計測を単純化)
+          provenance: false
+          tags: |
+            ghcr.io/ippoan/rust-flickr:${{ steps.meta.outputs.tag }}
+            ghcr.io/ippoan/rust-flickr:latest
+
+      - name: Report image size (compressed)
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/ippoan/rust-flickr:${{ steps.meta.outputs.tag }}"
+          docker buildx imagetools inspect "$IMAGE" --raw > manifest.json
+          LAYERS=$(jq '[.layers[].size] | add' manifest.json)
+          {
+            echo "### Image size (scratch, compressed layers)"
+            echo ""
+            echo "| Item | Value |"
+            echo "|------|-------|"
+            echo "| image | \`$IMAGE\` |"
+            echo "| layers total | $(numfmt --to=iec "$LAYERS") ($LAYERS bytes) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # staging deploy: ci-workflows の cloud-run-deploy.yml reusable。
+  # AR remote-repo (pull-through cache) 経由で digest pin した image を流す。
+  # Auth は WIF (GCP key 0 個運用)。
+  #
+  # gate: repo variable `STAGING_DEPLOY_ENABLED=true` を user が設定するまで skip。
+  # (org-level に GCP_WIF_* vars が存在しても、本 repo の WIF binding +
+  #  Cloud Run service 初回作成が済むまでは deploy が確実に fail するため、
+  #  setup 完了の明示 flag として repo var を別に置く。README の手順参照)
+  deploy-staging:
+    name: Deploy (staging)
+    needs: [ci, build-image]
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.draft != true &&
+      vars.STAGING_DEPLOY_ENABLED == 'true' &&
+      vars.GCP_WIF_PROVIDER != '' &&
+      vars.GCP_WIF_SERVICE_ACCOUNT_STAGING != ''
+    permissions:
+      contents: read
+      id-token: write
+      packages: read
+    uses: ippoan/ci-workflows/.github/workflows/cloud-run-deploy.yml@main
+    with:
+      service: rust-flickr-staging
+      region: asia-northeast1
+      project: cloudsql-sv
+      ghcr_image: ghcr.io/ippoan/rust-flickr
+      image_tag: ${{ needs.build-image.outputs.image_tag }}
+      ar_repo: asia-northeast1-docker.pkg.dev/cloudsql-sv/ghcr/ippoan/rust-flickr
+      workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+      service_account: ${{ vars.GCP_WIF_SERVICE_ACCOUNT_STAGING }}
+
+  # 全 CI job が success / skipped した時だけ auto-merge を enable する
+  # (release-wave-gcp と同 pattern)。`needs:` が success 評価された時点で
+  # 「全 CI green が確定」しているため、required check 未設定でも CI fail 中の
+  # 誤 merge は起きない。deploy-staging は vars 未設定時 skip なので
+  # `|| skipped` も許容する。
+  auto-merge:
+    name: Auto Merge
+    needs: [ci, build-image, deploy-staging]
+    if: >-
+      always() &&
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.draft == false &&
+      needs.ci.result == 'success' &&
+      (needs.build-image.result == 'success' || needs.build-image.result == 'skipped') &&
+      (needs.deploy-staging.result == 'success' || needs.deploy-staging.result == 'skipped')
+    uses: ippoan/ci-workflows/.github/workflows/auto-merge.yml@main
+    permissions:
+      contents: write
+      pull-requests: write
+    # auto-merge.yml は CI_APP_ID / CI_APP_PRIVATE_KEY (org secret, GitHub App)
+    # で installation token を mint する (github.token fallback は撤去済 =
+    # ci-workflows#65)。least-privilege: 必要な 2 secret だけ named で渡す。
+    secrets:
+      CI_APP_ID: ${{ secrets.CI_APP_ID }}
+      CI_APP_PRIVATE_KEY: ${{ secrets.CI_APP_PRIVATE_KEY }}
