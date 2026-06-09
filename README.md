@@ -140,7 +140,42 @@ gcloud run deploy rust-flickr-staging \
 #      STAGING_DEPLOY_ENABLED = true
 ```
 
-`FLICKR_*` / `DATABASE_URL` の Secret Manager 投入と runtime SA 整備は PR5 (Refs #1)。
+### Secrets (one-time、PR5)
+
+`deploy-staging` は以下の Secret Manager secret を **secretKeyRef** で注入する
+(値は workflow / log を経由しない):
+
+| Cloud Run env | Secret Manager secret |
+| --- | --- |
+| `FLICKR_CONSUMER_KEY` | `rust-flickr-consumer-key` |
+| `FLICKR_CONSUMER_SECRET` | `rust-flickr-consumer-secret` |
+| `DATABASE_URL` | `rust-flickr-database-url` |
+
+`FLICKR_CALLBACK_URL` は非 secret なので plain env (`set_env_vars`)。
+
+投入は rust-logi の Cloud Run env (平文) から値をコピーする。値を画面に出さずに
+移送する one-shot (Cloud Shell):
+
+```sh
+PROJECT=cloudsql-sv
+REGION=asia-northeast1
+SRC_SERVICE=rust-logi   # rust-logi の Cloud Run service 名 (異なる場合は修正)
+
+get_env() {
+  gcloud run services describe "$SRC_SERVICE" --project "$PROJECT" --region "$REGION" --format=json \
+  | python3 -c "import json,sys; envs=json.load(sys.stdin)['spec']['template']['spec']['containers'][0]['env']; sys.stdout.write(next(e['value'] for e in envs if e['name']=='$1'))"
+}
+
+get_env FLICKR_CONSUMER_KEY    | gcloud secrets create rust-flickr-consumer-key    --project "$PROJECT" --replication-policy=automatic --data-file=-
+get_env FLICKR_CONSUMER_SECRET | gcloud secrets create rust-flickr-consumer-secret --project "$PROJECT" --replication-policy=automatic --data-file=-
+get_env DATABASE_URL           | gcloud secrets create rust-flickr-database-url    --project "$PROJECT" --replication-policy=automatic --data-file=-
+```
+
+runtime SA (default compute SA) には project-wide の `secretmanager.secretAccessor`
+が付与済み (rust-alc-api と同じ)。専用 SA に切り替える場合は per-secret IAM を付ける。
+
+> **注意**: secret 未投入のまま `deploy-staging` が走ると `secretKeyRef` 解決に失敗して
+> revision 作成がエラーになる。**先に上記 3 secret を投入**してから merge すること。
 
 ### 計測 (PR1 の検証項目)
 
