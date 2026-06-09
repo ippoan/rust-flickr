@@ -49,6 +49,18 @@ cargo test
 `Cargo.lock` は commit する (CI は `--locked` でビルド)。依存を追加・更新したら
 lock の差分も同じ PR に含める。
 
+## 環境
+
+`secrets-inventory-gcp` / `release-wave-gcp` に揃えて **staging を実運用環境**とする。
+
+| env | Cloud Run service | trigger |
+|---|---|---|
+| staging (live = 実運用) | `rust-flickr-staging` | PR (non-draft) |
+| production | `rust-flickr` | `v*` tag push (当面未使用) |
+
+**staging 反映 = 本番反映**。PR を上げると staging に auto-deploy されるため、
+壊れた変更を PR に積まない (CI gate が green になってから deploy job が走る)。
+
 ## CI / デプロイ
 
 - CI (`.github/workflows/ci.yml`) は `ippoan/ci-workflows` の `rust-ci.yml`

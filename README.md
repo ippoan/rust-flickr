@@ -63,6 +63,17 @@ Job Summary に記録する。
 
 ## CI / デプロイ
 
+### 環境
+
+`secrets-inventory-gcp` / `release-wave-gcp` に揃えて **staging を実運用環境**とする。
+
+| env | Cloud Run service | trigger |
+| --- | --- | --- |
+| staging (live = 実運用) | `rust-flickr-staging` | PR (non-draft) |
+| production | `rust-flickr` | `v*` tag push (当面未使用) |
+
+### CI jobs
+
 | job | 内容 |
 | --- | --- |
 | `ci / fmt,clippy,test,build` | `ippoan/ci-workflows` の `rust-ci.yml` reusable |
