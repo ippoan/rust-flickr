@@ -31,3 +31,27 @@ pub struct OauthCallbackResponse {
     pub username: String,
     pub saved: bool,
 }
+
+/// POST /import のリクエスト (body は省略可)
+#[derive(Serialize, Deserialize, Default)]
+pub struct ImportRequest {
+    /// 1 回で処理する最大件数 (default 500)
+    pub limit: Option<i64>,
+}
+
+/// 検証済み Flickr 写真 (flickr_photo へ登録した行)
+#[derive(Serialize, Deserialize)]
+pub struct FlickrPhoto {
+    pub id: String,
+    pub secret: String,
+    pub server: String,
+}
+
+/// POST /import のレスポンス
+#[derive(Serialize, Deserialize)]
+pub struct ImportResponse {
+    pub imported_count: i32,
+    pub errors_count: i32,
+    pub remaining_count: i32,
+    pub photos: Vec<FlickrPhoto>,
+}

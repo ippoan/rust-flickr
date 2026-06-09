@@ -14,7 +14,10 @@ use sqlx::PgPool;
 use crate::db;
 use crate::error::ApiError;
 use crate::flickr::FlickrClient;
-use crate::types::{OauthCallbackRequest, OauthCallbackResponse, OauthUrlResponse};
+use crate::types::{
+    FlickrPhoto, ImportRequest, ImportResponse, OauthCallbackRequest, OauthCallbackResponse,
+    OauthUrlResponse,
+};
 
 pub const ORGANIZATION_HEADER: &str = "x-organization-id";
 
@@ -62,6 +65,7 @@ pub fn app(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/oauth/url", get(oauth_url))
         .route("/oauth/callback", post(oauth_callback))
+        .route("/import", post(import_photos))
         .with_state(state)
 }
 
@@ -145,6 +149,102 @@ async fn oauth_callback(
     }))
 }
 
+/// 未検証の cam_files.flickr_id を flickr.photos.getInfo で検証して
+/// flickr_photo に登録する (旧 ImportFlickrPhotos の移植)。
+///
+/// 「黙って 200」禁止 (Refs #1):
+/// - token 未登録 → 412 (旧実装はここで gRPC failed_precondition → HTTP 200 に化けていた)
+/// - 個々の写真の検証失敗は errors_count に集計して処理は継続
+/// - 未検証 0 件は正常系 (200, imported=0, remaining=0)
+async fn import_photos(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Option<Json<ImportRequest>>,
+) -> Result<Json<ImportResponse>, ApiError> {
+    let flickr = state.flickr()?;
+    let pool = state.pool()?;
+    let organization_id = require_organization(&headers)?;
+
+    let req = body.map(|Json(r)| r).unwrap_or_default();
+    let limit = match req.limit {
+        None => 500,
+        Some(n) if n > 0 => n,
+        Some(_) => {
+            return Err(ApiError::BadRequest(
+                "limit must be a positive integer".to_string(),
+            ))
+        }
+    };
+
+    let mut conn = pool.acquire().await.map_err(ApiError::from)?;
+    db::set_current_organization(&mut conn, &organization_id).await?;
+
+    let token = db::get_flickr_token(&mut conn)
+        .await?
+        .ok_or(ApiError::NoToken)?;
+
+    let unverified = db::list_unverified_flickr_ids(&mut conn, limit).await?;
+    if unverified.is_empty() {
+        tracing::info!(organization_id, "no unverified flickr photos");
+        return Ok(Json(ImportResponse {
+            imported_count: 0,
+            errors_count: 0,
+            remaining_count: 0,
+            photos: vec![],
+        }));
+    }
+
+    tracing::info!(
+        organization_id,
+        count = unverified.len(),
+        "verifying flickr photos"
+    );
+
+    let mut photos = Vec::new();
+    let mut errors_count = 0i32;
+
+    for flickr_id in &unverified {
+        match flickr
+            .photos_get_info(flickr_id, &token.access_token, &token.access_token_secret)
+            .await
+        {
+            Ok(photo) => match db::insert_flickr_photo(&mut conn, &organization_id, &photo).await {
+                Ok(()) => photos.push(FlickrPhoto {
+                    id: photo.id,
+                    secret: photo.secret,
+                    server: photo.server,
+                }),
+                Err(e) => {
+                    tracing::warn!(flickr_id, ?e, "failed to insert flickr_photo");
+                    errors_count += 1;
+                }
+            },
+            Err(e) => {
+                tracing::warn!(flickr_id, error = e, "failed to fetch flickr photo info");
+                errors_count += 1;
+            }
+        }
+    }
+
+    let remaining = db::count_unverified(&mut conn).await?;
+    let imported_count = photos.len() as i32;
+
+    tracing::info!(
+        organization_id,
+        imported_count,
+        errors_count,
+        remaining,
+        "import completed"
+    );
+
+    Ok(Json(ImportResponse {
+        imported_count,
+        errors_count,
+        remaining_count: remaining as i32,
+        photos,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,6 +268,7 @@ mod tests {
             format!("{}/request_token", server.uri()),
             format!("{}/access_token", server.uri()),
             format!("{}/authorize", server.uri()),
+            format!("{}/rest/", server.uri()),
         )
     }
 
@@ -393,5 +494,66 @@ mod tests {
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         // access token がレスポンスに漏れないこと
         assert!(!body.to_string().contains("secret-at"));
+    }
+
+    #[tokio::test]
+    async fn import_503_when_not_configured() {
+        let (status, _) = send(
+            AppState::default(),
+            Request::post("/import").body(Body::empty()).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn import_400_without_org_header() {
+        let server = MockServer::start().await;
+        let state = AppState {
+            pool: Some(dead_pool()),
+            flickr: Some(test_flickr(&server)),
+        };
+        let (status, _) = send(state, Request::post("/import").body(Body::empty()).unwrap()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn import_400_with_non_positive_limit() {
+        let server = MockServer::start().await;
+        let state = AppState {
+            pool: Some(dead_pool()),
+            flickr: Some(test_flickr(&server)),
+        };
+        let (status, body) = send(
+            state,
+            Request::post("/import")
+                .header(ORGANIZATION_HEADER, ORG)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"limit":0}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["message"].as_str().unwrap().contains("positive"));
+    }
+
+    #[tokio::test]
+    async fn import_500_when_db_unreachable() {
+        // org/limit バリデーション通過後、DB 接続で落ちる → 500 (黙って 200 にならない)
+        let server = MockServer::start().await;
+        let state = AppState {
+            pool: Some(dead_pool()),
+            flickr: Some(test_flickr(&server)),
+        };
+        let (status, body) = send(
+            state,
+            Request::post("/import")
+                .header(ORGANIZATION_HEADER, ORG)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["message"], "internal error");
     }
 }
