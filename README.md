@@ -25,7 +25,7 @@ Cloud Run で稼働し、**scratch 極小イメージ** (musl static + rustls) �
 | POST | `/oauth/callback` | ✅ PR2 | verifier → access token 交換 + `flickr_tokens` UPSERT。token はレスポンスに echo しない (`{user_nsid, username, saved}`) |
 | POST | `/import` | ✅ PR3 | 未検証 `cam_files.flickr_id` を `flickr.photos.getInfo` で検証して `flickr_photo` 登録。body `{limit}` (省略時 500)。token 未登録は **412** |
 
-`/oauth/*` は `X-Organization-Id` ヘッダ (organization UUID) が**必須** —
+`/oauth/*` と `/import` は `X-Organization-Id` ヘッダ (organization UUID) が**必須** —
 欠落/非 UUID は 400。デフォルト org への暗黙フォールバックは置かない (Refs #1)。
 
 ### 環境変数
