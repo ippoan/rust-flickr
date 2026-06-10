@@ -11,12 +11,13 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use sqlx::PgPool;
 
+use crate::cam::{CamClient, CamConfig};
 use crate::db;
 use crate::error::ApiError;
 use crate::flickr::FlickrClient;
 use crate::types::{
     FlickrPhoto, ImportRequest, ImportResponse, OauthCallbackRequest, OauthCallbackResponse,
-    OauthUrlResponse,
+    OauthUrlResponse, SyncRequest, SyncResponse,
 };
 
 pub const ORGANIZATION_HEADER: &str = "x-organization-id";
@@ -27,6 +28,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub struct AppState {
     pub pool: Option<PgPool>,
     pub flickr: Option<FlickrClient>,
+    pub cam: Option<CamConfig>,
 }
 
 impl AppState {
@@ -39,6 +41,12 @@ impl AppState {
     fn flickr(&self) -> Result<&FlickrClient, ApiError> {
         self.flickr.as_ref().ok_or(ApiError::NotConfigured(
             "FLICKR_CONSUMER_KEY/FLICKR_CONSUMER_SECRET",
+        ))
+    }
+
+    fn cam(&self) -> Result<&CamConfig, ApiError> {
+        self.cam.as_ref().ok_or(ApiError::NotConfigured(
+            "CAM_DIGEST_USER/CAM_DIGEST_PASS/CAM_MACHINE_NAME/CAM_SDCARD_CGI/CAM_MP4_CGI/CAM_JPG_CGI",
         ))
     }
 }
@@ -72,6 +80,7 @@ pub fn app(state: AppState) -> Router {
         .route("/oauth/url", get(oauth_url))
         .route("/oauth/callback", post(oauth_callback))
         .route("/import", post(import_photos))
+        .route("/sync", post(sync_cam_files))
         .with_state(state)
 }
 
@@ -251,6 +260,193 @@ async fn import_photos(
     }))
 }
 
+/// カメラ SD カードの巡回 → cam_files UPSERT → Flickr アップロード
+/// (旧 rust-logi SyncCamFiles の移植、Refs #9)。
+///
+/// 旧実装との差分:
+/// - upload は `tokio::spawn` (background) ではなく**同期実行** — Cloud Run は
+///   CPU throttling (default) のため response 返却後の background task は完走
+///   しない。1 回の処理量は `upload_limit` で制御し、残りは次回 sync が拾う
+/// - 失敗の明示 (Refs #1): cam env 未設定 503 / org ヘッダ無し 400 /
+///   カメラの日付一覧が取れない 424 / DB 500。token 不在は sync 自体は成立
+///   させ `flickr_token_present: false` で明示する (旧実装は info log のみ)
+async fn sync_cam_files(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Option<Json<SyncRequest>>,
+) -> Result<Json<SyncResponse>, ApiError> {
+    let cam_config = state.cam()?;
+    let pool = state.pool()?;
+    let organization_id = require_organization(&headers)?;
+
+    let req = body.map(|Json(r)| r).unwrap_or_default();
+    let upload_limit = match req.upload_limit {
+        None => 50,
+        Some(n) if n >= 0 => n,
+        Some(_) => {
+            return Err(ApiError::BadRequest(
+                "upload_limit must be a non-negative integer".to_string(),
+            ))
+        }
+    };
+
+    let mut conn = pool.acquire().await.map_err(ApiError::from)?;
+    db::set_current_organization(&mut conn, &organization_id).await?;
+
+    // 1. 最終レコード → 再開位置 (RLS で現 org の行だけが見える)
+    let (start_date, start_hour) =
+        db::last_cam_file(&mut conn).await?.ok_or_else(|| {
+            ApiError::BadRequest(
+                "no existing cam_files rows for this organization; cannot determine sync start position".to_string(),
+            )
+        })?;
+    tracing::info!(organization_id, start_date, start_hour, "sync started");
+
+    let client = CamClient::new(cam_config.clone());
+
+    // 2. 日付一覧 (取れなければ致命 = 424 をそのまま返す)
+    let all_dates = client.list_dates().await?;
+    let start_date_int: i64 = start_date.parse().unwrap_or(0);
+    let dates: Vec<&String> = all_dates
+        .iter()
+        .filter(|d| d.parse::<i64>().unwrap_or(0) >= start_date_int)
+        .collect();
+    let processed_dates = dates.len() as i32;
+
+    // 3. 時間一覧 (個別失敗は warn + continue — 旧実装互換)
+    let start_hour_int: i64 = start_hour.parse().unwrap_or(0);
+    let mut hours: Vec<(String, String)> = Vec::new();
+    for date in &dates {
+        match client.list_hours(date).await {
+            Ok(hour_dirs) => {
+                for hour in hour_dirs {
+                    if date.as_str() == start_date {
+                        if hour.parse::<i64>().unwrap_or(0) >= start_hour_int {
+                            hours.push(((*date).clone(), hour));
+                        }
+                    } else {
+                        hours.push(((*date).clone(), hour));
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(date = date.as_str(), ?e, "failed to list hours"),
+        }
+    }
+    let processed_hours = hours.len() as i32;
+
+    // 4. ファイル一覧 → UPSERT
+    let mut new_files = 0i32;
+    for (date, hour) in &hours {
+        match client.list_file_names(date, hour).await {
+            Ok(filenames) => {
+                for filename in filenames {
+                    let file_type = if filename.contains(".mp4") {
+                        "mp4"
+                    } else {
+                        "jpg"
+                    };
+                    match db::upsert_cam_file(
+                        &mut conn,
+                        &organization_id,
+                        &filename,
+                        date,
+                        hour,
+                        file_type,
+                        client.machine_name(),
+                    )
+                    .await
+                    {
+                        Ok(()) => new_files += 1,
+                        Err(e) => tracing::warn!(filename, ?e, "failed to upsert cam_file"),
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(date, hour, ?e, "failed to list files"),
+        }
+    }
+
+    // 5. Flickr アップロード (同期、upload_limit 件まで)
+    let token = db::get_flickr_token(&mut conn).await?;
+    let flickr_token_present = token.is_some();
+    let mut uploaded_count = 0i32;
+    let mut upload_errors = 0i32;
+
+    if upload_limit > 0 {
+        match (state.flickr.as_ref(), token) {
+            (Some(flickr), Some(token)) => {
+                let unuploaded =
+                    db::list_unuploaded_cam_files(&mut conn, &start_date, upload_limit).await?;
+                for file in unuploaded {
+                    let result = match client.download(&file.name, &file.date, &file.hour).await {
+                        Ok(data) => {
+                            flickr
+                                .upload_photo(
+                                    &token.access_token,
+                                    &token.access_token_secret,
+                                    &file.name,
+                                    data,
+                                )
+                                .await
+                        }
+                        Err(e) => Err(e),
+                    };
+                    match result {
+                        Ok(flickr_id) => {
+                            match db::set_cam_file_flickr_id(&mut conn, &file.name, &flickr_id)
+                                .await
+                            {
+                                Ok(()) => {
+                                    uploaded_count += 1;
+                                    tracing::info!(name = file.name, flickr_id, "flickr upload ok");
+                                }
+                                Err(e) => {
+                                    upload_errors += 1;
+                                    tracing::warn!(
+                                        name = file.name,
+                                        flickr_id,
+                                        ?e,
+                                        "uploaded but failed to record flickr_id"
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            upload_errors += 1;
+                            tracing::warn!(name = file.name, error = e, "flickr upload failed");
+                        }
+                    }
+                }
+            }
+            _ => {
+                tracing::info!(
+                    organization_id,
+                    flickr_token_present,
+                    "flickr not configured or no access token — skipping uploads"
+                );
+            }
+        }
+    }
+
+    let remaining_unuploaded = db::count_unuploaded_cam_files(&mut conn, &start_date).await? as i32;
+
+    let message = format!(
+        "Synced {processed_dates} dates, {processed_hours} hours, {new_files} files. \
+         Uploaded {uploaded_count} to Flickr ({upload_errors} errors, {remaining_unuploaded} remaining)."
+    );
+    tracing::info!(organization_id, message, "sync completed");
+
+    Ok(Json(SyncResponse {
+        processed_dates,
+        processed_hours,
+        new_files,
+        flickr_token_present,
+        uploaded_count,
+        upload_errors,
+        remaining_unuploaded,
+        message,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,6 +536,7 @@ mod tests {
         let state = AppState {
             pool: None,
             flickr: Some(test_flickr(&server)),
+            cam: None,
         };
         let (status, body) = send(
             state,
@@ -356,6 +553,7 @@ mod tests {
         let state = AppState {
             pool: Some(dead_pool()),
             flickr: Some(test_flickr(&server)),
+            cam: None,
         };
         let (status, body) = send(
             state,
@@ -375,6 +573,7 @@ mod tests {
         let state = AppState {
             pool: Some(dead_pool()),
             flickr: Some(test_flickr(&server)),
+            cam: None,
         };
         let (status, body) = send(
             state,
@@ -399,6 +598,7 @@ mod tests {
         let state = AppState {
             pool: Some(dead_pool()),
             flickr: Some(test_flickr(&server)),
+            cam: None,
         };
         let (status, _) = send(
             state,
@@ -425,6 +625,7 @@ mod tests {
         let state = AppState {
             pool: Some(dead_pool()),
             flickr: Some(test_flickr(&server)),
+            cam: None,
         };
         let (status, body) = send(
             state,
@@ -444,6 +645,7 @@ mod tests {
         let state = AppState {
             pool: Some(dead_pool()),
             flickr: Some(test_flickr(&server)),
+            cam: None,
         };
         let (status, _) = send(
             state,
@@ -470,6 +672,7 @@ mod tests {
         let state = AppState {
             pool: Some(dead_pool()),
             flickr: Some(test_flickr(&server)),
+            cam: None,
         };
         let (status, _) = send(
             state,
@@ -498,6 +701,7 @@ mod tests {
         let state = AppState {
             pool: Some(dead_pool()),
             flickr: Some(test_flickr(&server)),
+            cam: None,
         };
         let (status, body) = send(
             state,
@@ -525,12 +729,91 @@ mod tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     }
 
+    fn test_cam(server: &MockServer) -> crate::cam::CamConfig {
+        crate::cam::CamConfig {
+            digest_user: "u".to_string(),
+            digest_pass: "p".to_string(),
+            machine_name: "cam1".to_string(),
+            sdcard_cgi: format!("{}/sd/", server.uri()),
+            mp4_cgi: format!("{}/mp4/", server.uri()),
+            jpg_cgi: format!("{}/jpg/", server.uri()),
+            cf_access_client_id: None,
+            cf_access_client_secret: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_503_when_cam_not_configured() {
+        let (status, body) = send(
+            AppState::default(),
+            Request::post("/sync").body(Body::empty()).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body["message"].as_str().unwrap().contains("CAM_"));
+    }
+
+    #[tokio::test]
+    async fn sync_400_without_org_header() {
+        let server = MockServer::start().await;
+        let state = AppState {
+            pool: Some(dead_pool()),
+            flickr: None,
+            cam: Some(test_cam(&server)),
+        };
+        let (status, _) = send(state, Request::post("/sync").body(Body::empty()).unwrap()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn sync_400_with_negative_upload_limit() {
+        let server = MockServer::start().await;
+        let state = AppState {
+            pool: Some(dead_pool()),
+            flickr: None,
+            cam: Some(test_cam(&server)),
+        };
+        let (status, body) = send(
+            state,
+            Request::post("/sync")
+                .header(ORGANIZATION_HEADER, ORG)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"upload_limit":-1}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["message"].as_str().unwrap().contains("upload_limit"));
+    }
+
+    #[tokio::test]
+    async fn sync_500_when_db_unreachable() {
+        let server = MockServer::start().await;
+        let state = AppState {
+            pool: Some(dead_pool()),
+            flickr: None,
+            cam: Some(test_cam(&server)),
+        };
+        let (status, body) = send(
+            state,
+            Request::post("/sync")
+                .header(ORGANIZATION_HEADER, ORG)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        // 接続文字列等の内部詳細を echo しない
+        assert_eq!(body["message"], "internal error");
+    }
+
     #[tokio::test]
     async fn import_400_without_org_header() {
         let server = MockServer::start().await;
         let state = AppState {
             pool: Some(dead_pool()),
             flickr: Some(test_flickr(&server)),
+            cam: None,
         };
         let (status, _) = send(state, Request::post("/import").body(Body::empty()).unwrap()).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -542,6 +825,7 @@ mod tests {
         let state = AppState {
             pool: Some(dead_pool()),
             flickr: Some(test_flickr(&server)),
+            cam: None,
         };
         let (status, body) = send(
             state,
@@ -563,6 +847,7 @@ mod tests {
         let state = AppState {
             pool: Some(dead_pool()),
             flickr: Some(test_flickr(&server)),
+            cam: None,
         };
         let (status, body) = send(
             state,

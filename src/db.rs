@@ -165,3 +165,102 @@ pub async fn count_unverified(conn: &mut PgConnection) -> Result<i64, ApiError> 
     .await?;
     Ok(count)
 }
+
+// ---- cam_files 同期 (POST /sync, Refs #9) ----
+
+/// cam_files の 1 行 (sync / upload ループで使用)
+pub struct CamFileRow {
+    pub name: String,
+    pub date: String,
+    pub hour: String,
+}
+
+/// 最終レコードの (date, hour) — sync の再開位置 (rust-logi 互換: name 降順)
+pub async fn last_cam_file(conn: &mut PgConnection) -> Result<Option<(String, String)>, ApiError> {
+    let row: Option<(String, String)> =
+        sqlx::query_as("SELECT date, hour FROM cam_files ORDER BY name DESC LIMIT 1")
+            .fetch_optional(conn)
+            .await?;
+    Ok(row)
+}
+
+/// カメラ上のファイルを cam_files に UPSERT
+pub async fn upsert_cam_file(
+    conn: &mut PgConnection,
+    organization_id: &str,
+    name: &str,
+    date: &str,
+    hour: &str,
+    file_type: &str,
+    cam: &str,
+) -> Result<(), ApiError> {
+    sqlx::query(
+        r#"
+        INSERT INTO cam_files (name, organization_id, date, hour, type, cam)
+        VALUES ($1, $2::uuid, $3, $4, $5, $6)
+        ON CONFLICT (organization_id, name) DO UPDATE SET
+            date = EXCLUDED.date, hour = EXCLUDED.hour,
+            type = EXCLUDED.type, cam = EXCLUDED.cam
+        "#,
+    )
+    .bind(name)
+    .bind(organization_id)
+    .bind(date)
+    .bind(hour)
+    .bind(file_type)
+    .bind(cam)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+/// Flickr 未アップロード (flickr_id IS NULL) のファイルを古い順に取得
+pub async fn list_unuploaded_cam_files(
+    conn: &mut PgConnection,
+    start_date: &str,
+    limit: i64,
+) -> Result<Vec<CamFileRow>, ApiError> {
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        r#"
+        SELECT name, date, hour FROM cam_files
+        WHERE date >= $1 AND flickr_id IS NULL
+        ORDER BY name
+        LIMIT $2
+        "#,
+    )
+    .bind(start_date)
+    .bind(limit)
+    .fetch_all(conn)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(name, date, hour)| CamFileRow { name, date, hour })
+        .collect())
+}
+
+/// Flickr 未アップロードの残数
+pub async fn count_unuploaded_cam_files(
+    conn: &mut PgConnection,
+    start_date: &str,
+) -> Result<i64, ApiError> {
+    let (count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM cam_files WHERE date >= $1 AND flickr_id IS NULL")
+            .bind(start_date)
+            .fetch_one(conn)
+            .await?;
+    Ok(count)
+}
+
+/// アップロード成功した flickr_id を記録
+pub async fn set_cam_file_flickr_id(
+    conn: &mut PgConnection,
+    name: &str,
+    flickr_id: &str,
+) -> Result<(), ApiError> {
+    sqlx::query("UPDATE cam_files SET flickr_id = $1 WHERE name = $2")
+        .bind(flickr_id)
+        .bind(name)
+        .execute(conn)
+        .await?;
+    Ok(())
+}
