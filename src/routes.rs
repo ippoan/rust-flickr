@@ -62,6 +62,12 @@ fn require_organization(headers: &HeaderMap) -> Result<String, ApiError> {
 
 pub fn app(state: AppState) -> Router {
     Router::new()
+        // /health と /healthz は同一 handler。外形監視には /health を使うこと —
+        // run.app / ghs (domain mapping) の Google フロントは `/healthz` を
+        // インターセプトして汎用 404 を返すため、外から /healthz は見えない
+        // (ippoan の他 Cloud Run service が /health 標準なのも同じ理由。
+        //  Refs ippoan/cf-flickr-proxy#1 の cutover 検証)。
+        .route("/health", get(healthz))
         .route("/healthz", get(healthz))
         .route("/oauth/url", get(oauth_url))
         .route("/oauth/callback", post(oauth_callback))
@@ -294,6 +300,19 @@ mod tests {
         let (status, body) = send(
             AppState::default(),
             Request::get("/healthz").body(Body::empty()).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["service"], "rust-flickr");
+    }
+
+    #[tokio::test]
+    async fn health_alias_works_without_any_config() {
+        // 外形監視用 alias (/healthz は Google フロントに食われるため)
+        let (status, body) = send(
+            AppState::default(),
+            Request::get("/health").body(Body::empty()).unwrap(),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
