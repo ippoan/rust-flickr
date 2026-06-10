@@ -5,7 +5,7 @@
 //! ヘッダ欠落時に固定 org に黙ってフォールバックし、RLS で token が
 //! 見えず 0 件取り込みが続いた)。
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::HeaderMap;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -16,8 +16,8 @@ use crate::db;
 use crate::error::ApiError;
 use crate::flickr::FlickrClient;
 use crate::types::{
-    FlickrPhoto, ImportRequest, ImportResponse, OauthCallbackRequest, OauthCallbackResponse,
-    OauthUrlResponse, SyncRequest, SyncResponse,
+    DayStat, FlickrPhoto, ImportRequest, ImportResponse, OauthCallbackRequest,
+    OauthCallbackResponse, OauthUrlResponse, StatsResponse, SyncRequest, SyncResponse,
 };
 
 pub const ORGANIZATION_HEADER: &str = "x-organization-id";
@@ -94,6 +94,7 @@ pub fn app(state: AppState) -> Router {
         .route("/oauth/callback", post(oauth_callback))
         .route("/import", post(import_photos))
         .route("/sync", post(sync_cam_files))
+        .route("/stats", get(stats))
         .with_state(state)
 }
 
@@ -463,6 +464,43 @@ async fn sync_cam_files(
     }))
 }
 
+#[derive(serde::Deserialize, Default)]
+struct StatsQuery {
+    days: Option<i64>,
+}
+
+/// 撮影日別の登録 / Flickr upload / 検証の集計 (daily report 用、Refs #12)
+async fn stats(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<StatsQuery>,
+) -> Result<Json<StatsResponse>, ApiError> {
+    let pool = state.pool()?;
+    let organization_id = require_organization(&headers)?;
+    let days = query.days.unwrap_or(7).clamp(1, 60);
+
+    let mut conn = pool.acquire().await.map_err(ApiError::from)?;
+    db::set_current_organization(&mut conn, &organization_id).await?;
+
+    let day_rows = db::day_stats(&mut conn, days).await?;
+    let total_unuploaded = db::count_total_unuploaded(&mut conn).await?;
+    let total_unverified = db::count_unverified(&mut conn).await?;
+
+    Ok(Json(StatsResponse {
+        days: day_rows
+            .into_iter()
+            .map(|(date, files, uploaded, verified)| DayStat {
+                date,
+                files,
+                uploaded,
+                verified,
+            })
+            .collect(),
+        total_unuploaded,
+        total_unverified,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -767,6 +805,46 @@ mod tests {
         ];
         assert_eq!(min_sd_date(&dates), Some("20260524".to_string()));
         assert_eq!(min_sd_date(&[]), None);
+    }
+
+    #[tokio::test]
+    async fn stats_503_when_db_not_configured() {
+        let (status, _) = send(
+            AppState::default(),
+            Request::get("/stats").body(Body::empty()).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn stats_400_without_org_header() {
+        let state = AppState {
+            pool: Some(dead_pool()),
+            flickr: None,
+            cam: None,
+        };
+        let (status, _) = send(state, Request::get("/stats").body(Body::empty()).unwrap()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn stats_500_when_db_unreachable_without_detail_echo() {
+        let state = AppState {
+            pool: Some(dead_pool()),
+            flickr: None,
+            cam: None,
+        };
+        let (status, body) = send(
+            state,
+            Request::get("/stats?days=3")
+                .header(ORGANIZATION_HEADER, ORG)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["message"], "internal error");
     }
 
     #[tokio::test]

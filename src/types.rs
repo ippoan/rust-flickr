@@ -99,3 +99,28 @@ pub struct SyncResponse {
     pub remaining_unuploaded: i32,
     pub message: String,
 }
+
+/// 撮影日 (cam_files.date) 別の集計 (Refs #12)
+#[derive(Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct DayStat {
+    pub date: String,
+    /// cam_files の行数
+    pub files: i64,
+    /// flickr_id 付与済み (= Flickr アップロード済み)
+    pub uploaded: i64,
+    /// flickr_photo 登録済み (= /import で検証済み)
+    pub verified: i64,
+}
+
+/// GET /stats のレスポンス (Refs #12)
+#[derive(Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct StatsResponse {
+    /// 直近 N 日 (新しい順)
+    pub days: Vec<DayStat>,
+    /// 全期間の flickr_id IS NULL 残数
+    pub total_unuploaded: i64,
+    /// 全期間の flickr_photo 未登録残数
+    pub total_unverified: i64,
+}
