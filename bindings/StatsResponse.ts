@@ -16,4 +16,9 @@ total_unuploaded: bigint,
 /**
  * 全期間の flickr_photo 未登録残数
  */
-total_unverified: bigint, };
+total_unverified: bigint, 
+/**
+ * 最古の未アップロード撮影日 (YYYYMMDD)。upload は古い順なので、
+ * この値が日々進む = backfill が SD ローテーションに勝っている目印
+ */
+oldest_unuploaded_date?: string, };
