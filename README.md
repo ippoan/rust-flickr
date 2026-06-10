@@ -8,14 +8,22 @@ Cloud Run で稼働し、**scratch 極小イメージ** (musl static + rustls) �
 ## アーキテクチャ
 
 ```
-[ front (nuxt) ]──REST──▶ [ cf-flickr-proxy (CF Worker) ] ──fetch──▶ [ rust-flickr (Cloud Run) ]
-[ Cloud Scheduler ]──────────────(Worker を経由せず直接)───────────▶ 同上 /import
+[ カメラ TS-NA230WP ] ◀─(CF tunnel + Digest 認証)─┐
+                                                   │
+[ Cloud Scheduler rust-flickr-sync   (*/10)    ]──▶ POST /sync   ─┐
+[ Cloud Scheduler rust-flickr-import (5-59/10) ]──▶ POST /import ─┤ rust-flickr (Cloud Run)
+[ front (nuxt) ]──REST──▶ [ cf-flickr-proxy (CF Worker) ]──fetch──┘   └─ Supabase / up.flickr.com
+[ cf-billing-monitor (毎朝 06:00 JST) ]───────────▶ GET /stats → メールレポート
 ```
 
 - edge Worker は [ippoan/cf-flickr-proxy](https://github.com/ippoan/cf-flickr-proxy)
   (REST proxy / CORS、status 透過)。公開 URL: **https://flickr-proxy.mtamaramu.com**
-- Cloud Scheduler は Worker を経由せず Cloud Run `/import` を直接叩く
-  (ippoan/cf-flickr-proxy#1 の決定事項)
+- Cloud Scheduler は Worker を経由せず Cloud Run を直接叩く
+  (ippoan/cf-flickr-proxy#1 の決定事項)。sync (`*/10`, body `{"upload_limit":100}`) と
+  import (`5-59/10`, body `{"limit":500}`) の 2 job、org ヘッダ付き
+- 日次レポートは [ippoan/cf-billing-monitor](https://github.com/ippoan/cf-billing-monitor)
+  が `/stats` を消費して CF Email Routing でメール配信 (cf-billing-monitor#4)
+- 旧経路 (cron-carpic → cf-grpc-proxy → rust-logi gRPC) は 2026-06-10 に廃止
 
 ## エンドポイント
 
@@ -27,8 +35,12 @@ Cloud Run で稼働し、**scratch 極小イメージ** (musl static + rustls) �
 | POST | `/oauth/callback` | ✅ PR2 | verifier → access token 交換 + `flickr_tokens` UPSERT。token はレスポンスに echo しない (`{user_nsid, username, saved}`) |
 | POST | `/import` | ✅ PR3 | 未検証 `cam_files.flickr_id` を `flickr.photos.getInfo` で検証して `flickr_photo` 登録。body `{limit}` (省略時 500)。token 未登録は **412** |
 | POST | `/sync` | ✅ #9 | カメラ SD カード巡回 → `cam_files` UPSERT → Flickr アップロード (旧 rust-logi `SyncCamFiles` の移植)。body `{upload_limit}` (省略時 50、0 で upload skip)。upload は**同期実行** (Cloud Run の CPU throttling で background task は完走しないため)。CAM_* env 未設定は 503、カメラ到達不能は 424 |
+| GET | `/stats` | ✅ #12 | 撮影日別 (query `days`、default 7、1..=60) の `files` / `uploaded` / `verified` と全期間の残数。daily report 用 read-only。**`oldest_unuploaded_date` は全期間の min** = SD から消えた回収不能分も指し得る (消化位置の表示はレポート側が窓内導出する、cf-billing-monitor#8) |
 
-`/oauth/*` と `/import` は `X-Organization-Id` ヘッダ (organization UUID) が**必須** —
+upload は**古い順** (`ORDER BY name`) で SD カードのローテーションと競争する。upload 対象の
+下限は「SD に実在する最古日」(#11 — 巡回再開位置を下限にすると backfill 後に過去分が漏れる)。
+
+`/oauth/*` / `/import` / `/sync` / `/stats` は `X-Organization-Id` ヘッダ (organization UUID) が**必須** —
 欠落/非 UUID は 400。デフォルト org への暗黙フォールバックは置かない (Refs #1)。
 
 ### 環境変数
