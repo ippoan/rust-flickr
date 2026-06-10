@@ -26,6 +26,7 @@ Cloud Run で稼働し、**scratch 極小イメージ** (musl static + rustls) �
 | GET | `/oauth/url` | ✅ PR2 | OAuth1.0a request token 取得 → 認可 URL 返却 |
 | POST | `/oauth/callback` | ✅ PR2 | verifier → access token 交換 + `flickr_tokens` UPSERT。token はレスポンスに echo しない (`{user_nsid, username, saved}`) |
 | POST | `/import` | ✅ PR3 | 未検証 `cam_files.flickr_id` を `flickr.photos.getInfo` で検証して `flickr_photo` 登録。body `{limit}` (省略時 500)。token 未登録は **412** |
+| POST | `/sync` | ✅ #9 | カメラ SD カード巡回 → `cam_files` UPSERT → Flickr アップロード (旧 rust-logi `SyncCamFiles` の移植)。body `{upload_limit}` (省略時 50、0 で upload skip)。upload は**同期実行** (Cloud Run の CPU throttling で background task は完走しないため)。CAM_* env 未設定は 503、カメラ到達不能は 424 |
 
 `/oauth/*` と `/import` は `X-Organization-Id` ヘッダ (organization UUID) が**必須** —
 欠落/非 UUID は 400。デフォルト org への暗黙フォールバックは置かない (Refs #1)。
@@ -36,6 +37,8 @@ Cloud Run で稼働し、**scratch 極小イメージ** (musl static + rustls) �
 | --- | --- | --- |
 | `PORT` | - | listen port (default 8080、Cloud Run が注入) |
 | `FLICKR_CONSUMER_KEY` / `FLICKR_CONSUMER_SECRET` | boot 時 optional | 未設定なら `/oauth/*` が 503 を返す (PR5 で Secret Manager 配線) |
+| `CAM_DIGEST_USER` / `CAM_DIGEST_PASS` / `CAM_MACHINE_NAME` / `CAM_SDCARD_CGI` / `CAM_MP4_CGI` / `CAM_JPG_CGI` | boot 時 optional | 未設定なら `/sync` が 503 を返す。rust-logi と同名 (= Cloud Run の値を流用可)。digest 資格情報と CF Access token は Secret Manager 参照、URL / machine name は plain env |
+| `CAM_CF_ACCESS_CLIENT_ID` / `CAM_CF_ACCESS_CLIENT_SECRET` | optional | カメラが CF Access 越しの場合の Service Token |
 | `FLICKR_CALLBACK_URL` | - | OAuth callback URL |
 | `DATABASE_URL` | boot 時 optional | rust-logi と共有の Supabase。未設定なら DB 系 endpoint が 503 |
 
