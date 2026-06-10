@@ -485,6 +485,7 @@ async fn stats(
     let day_rows = db::day_stats(&mut conn, days).await?;
     let total_unuploaded = db::count_total_unuploaded(&mut conn).await?;
     let total_unverified = db::count_unverified(&mut conn).await?;
+    let oldest_unuploaded_date = db::oldest_unuploaded_date(&mut conn).await?;
 
     Ok(Json(StatsResponse {
         days: day_rows
@@ -498,6 +499,7 @@ async fn stats(
             .collect(),
         total_unuploaded,
         total_unverified,
+        oldest_unuploaded_date,
     }))
 }
 
