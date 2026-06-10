@@ -264,3 +264,36 @@ pub async fn set_cam_file_flickr_id(
         .await?;
     Ok(())
 }
+
+// ---- 日次集計 (GET /stats, Refs #12) ----
+
+/// 撮影日別の (date, files, uploaded, verified) を新しい順に最大 limit 日分
+pub async fn day_stats(
+    conn: &mut PgConnection,
+    limit: i64,
+) -> Result<Vec<(String, i64, i64, i64)>, ApiError> {
+    Ok(sqlx::query_as(
+        r#"
+        SELECT cf.date,
+               count(*)::bigint AS files,
+               count(cf.flickr_id)::bigint AS uploaded,
+               count(fp.id)::bigint AS verified
+        FROM cam_files cf
+        LEFT JOIN flickr_photo fp ON cf.flickr_id = fp.id AND cf.organization_id = fp.organization_id
+        GROUP BY cf.date
+        ORDER BY cf.date DESC
+        LIMIT $1
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(conn)
+    .await?)
+}
+
+/// 全期間の flickr_id IS NULL 残数 (= 未アップロード)
+pub async fn count_total_unuploaded(conn: &mut PgConnection) -> Result<i64, ApiError> {
+    let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM cam_files WHERE flickr_id IS NULL")
+        .fetch_one(conn)
+        .await?;
+    Ok(count)
+}
