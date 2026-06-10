@@ -68,6 +68,19 @@ fn require_organization(headers: &HeaderMap) -> Result<String, ApiError> {
     Ok(parsed.to_string())
 }
 
+/// SD カード上に実在する最古の日付 (= upload 対象の下限)。
+/// 「巡回再開位置 (start_date) 以降」を下限にすると、巡回が最新日に追いついた
+/// 時点で過去の未アップロード分が upload 対象から漏れる (#9 移行時に実測 —
+/// remaining 11,643 件が一夜で 1,006 件に見えなくなった)。SD に実在する日付の
+/// 最小値を下限にすれば、SD から消えた古い行への無限再試行も避けられる
+fn min_sd_date(dates: &[String]) -> Option<String> {
+    dates
+        .iter()
+        .filter_map(|d| d.parse::<i64>().ok())
+        .min()
+        .map(|d| d.to_string())
+}
+
 pub fn app(state: AppState) -> Router {
     Router::new()
         // /health と /healthz は同一 handler。外形監視には /health を使うこと —
@@ -365,7 +378,9 @@ async fn sync_cam_files(
         }
     }
 
-    // 5. Flickr アップロード (同期、upload_limit 件まで)
+    // 5. Flickr アップロード (同期、upload_limit 件まで)。
+    //    下限は SD に実在する最古日 (dates が空なら巡回再開位置に fallback)
+    let upload_floor = min_sd_date(&all_dates).unwrap_or_else(|| start_date.clone());
     let token = db::get_flickr_token(&mut conn).await?;
     let flickr_token_present = token.is_some();
     let mut uploaded_count = 0i32;
@@ -375,7 +390,7 @@ async fn sync_cam_files(
         match (state.flickr.as_ref(), token) {
             (Some(flickr), Some(token)) => {
                 let unuploaded =
-                    db::list_unuploaded_cam_files(&mut conn, &start_date, upload_limit).await?;
+                    db::list_unuploaded_cam_files(&mut conn, &upload_floor, upload_limit).await?;
                 for file in unuploaded {
                     let result = match client.download(&file.name, &file.date, &file.hour).await {
                         Ok(data) => {
@@ -427,7 +442,8 @@ async fn sync_cam_files(
         }
     }
 
-    let remaining_unuploaded = db::count_unuploaded_cam_files(&mut conn, &start_date).await? as i32;
+    let remaining_unuploaded =
+        db::count_unuploaded_cam_files(&mut conn, &upload_floor).await? as i32;
 
     let message = format!(
         "Synced {processed_dates} dates, {processed_hours} hours, {new_files} files. \
@@ -740,6 +756,17 @@ mod tests {
             cf_access_client_id: None,
             cf_access_client_secret: None,
         }
+    }
+
+    #[test]
+    fn min_sd_date_picks_numeric_minimum_and_skips_junk() {
+        let dates = vec![
+            "20260610".to_string(),
+            "20260524".to_string(),
+            "not-a-date".to_string(),
+        ];
+        assert_eq!(min_sd_date(&dates), Some("20260524".to_string()));
+        assert_eq!(min_sd_date(&[]), None);
     }
 
     #[tokio::test]
