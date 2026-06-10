@@ -13,6 +13,7 @@ const REQUEST_TOKEN_URL: &str = "https://www.flickr.com/services/oauth/request_t
 const ACCESS_TOKEN_URL: &str = "https://www.flickr.com/services/oauth/access_token";
 const AUTHORIZE_URL: &str = "https://www.flickr.com/services/oauth/authorize";
 const REST_URL: &str = "https://www.flickr.com/services/rest/";
+const UPLOAD_URL: &str = "https://up.flickr.com/services/upload/";
 
 /// Flickr OAuth 1.0a 設定 (env から)
 #[derive(Clone)]
@@ -73,6 +74,7 @@ pub struct FlickrClient {
     access_token_url: String,
     authorize_url: String,
     rest_url: String,
+    upload_url: String,
 }
 
 impl FlickrClient {
@@ -100,7 +102,15 @@ impl FlickrClient {
             access_token_url,
             authorize_url,
             rest_url,
+            upload_url: UPLOAD_URL.to_string(),
         }
+    }
+
+    /// upload endpoint の差し替え (wiremock テスト用)
+    #[cfg(test)]
+    pub fn with_upload_url(mut self, url: impl Into<String>) -> Self {
+        self.upload_url = url.into();
+        self
     }
 
     /// OAuth 署名付き GET → form-encoded レスポンスをパース
@@ -302,6 +312,92 @@ impl FlickrClient {
             .photo
             .ok_or_else(|| format!("No photo data in Flickr response for photo {photo_id}"))
     }
+
+    /// 写真を Flickr Upload API にアップロードして photo id を返す (Refs #9)。
+    /// OAuth1 署名は oauth/API パラメータのみが対象で photo バイナリは含めない
+    /// (Flickr Upload API 仕様)。`tags=upBySytem` は hono-logi / rust-logi 互換
+    /// (タイポも互換維持)。upload ループで per-file 集計するため失敗は String
+    pub async fn upload_photo(
+        &self,
+        access_token: &str,
+        access_token_secret: &str,
+        title: &str,
+        data: Vec<u8>,
+    ) -> Result<String, String> {
+        let mut params = self.oauth_base_params();
+        params.insert("oauth_token".to_string(), access_token.to_string());
+        params.insert("title".to_string(), title.to_string());
+        params.insert("tags".to_string(), "upBySytem".to_string());
+
+        let signature = oauth1::sign(
+            "POST",
+            &self.upload_url,
+            &params,
+            &self.config.consumer_secret,
+            Some(access_token_secret),
+        );
+        params.insert("oauth_signature".to_string(), signature);
+
+        let mut form = reqwest::multipart::Form::new();
+        for (k, v) in &params {
+            form = form.text(k.clone(), v.clone());
+        }
+        let part = reqwest::multipart::Part::bytes(data)
+            .file_name(title.to_string())
+            .mime_str("application/octet-stream")
+            .map_err(|e| format!("multipart mime for {title}: {e}"))?;
+        form = form.part("photo", part);
+
+        let response = self
+            .http
+            .post(&self.upload_url)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| format!("flickr upload request failed for {title}: {e}"))?;
+
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            tracing::warn!(%status, body, title, "flickr upload failed");
+            return Err(format!("flickr upload failed for {title}: {status}"));
+        }
+
+        parse_upload_photoid(&body).ok_or_else(|| {
+            tracing::warn!(body, title, "flickr upload: photoid missing in response");
+            format!("flickr upload: photoid not found in response for {title}")
+        })
+    }
+}
+
+/// Flickr Upload API レスポンス XML から `<photoid>…</photoid>` を抽出
+fn parse_upload_photoid(xml: &str) -> Option<String> {
+    use quick_xml::events::Event;
+    use quick_xml::Reader;
+
+    let mut reader = Reader::from_str(xml);
+    let mut buf = Vec::new();
+    let mut in_photoid = false;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(ref e)) => {
+                if e.name().as_ref() == b"photoid" {
+                    in_photoid = true;
+                }
+            }
+            Ok(Event::Text(ref e)) => {
+                if in_photoid {
+                    return e.unescape().ok().map(|s| s.to_string());
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    None
 }
 
 #[cfg(test)]
@@ -344,6 +440,78 @@ mod tests {
         assert_eq!(c.access_token_url, ACCESS_TOKEN_URL);
         assert_eq!(c.authorize_url, AUTHORIZE_URL);
         assert_eq!(c.rest_url, REST_URL);
+        assert_eq!(c.upload_url, UPLOAD_URL);
+    }
+
+    #[test]
+    fn parse_upload_photoid_extracts_id() {
+        assert_eq!(
+            parse_upload_photoid(r#"<rsp stat="ok"><photoid>54321</photoid></rsp>"#),
+            Some("54321".to_string())
+        );
+        assert_eq!(
+            parse_upload_photoid(r#"<rsp stat="fail"><err code="5" msg="bad"/></rsp>"#),
+            None
+        );
+        assert_eq!(parse_upload_photoid("not xml"), None);
+    }
+
+    #[tokio::test]
+    async fn upload_photo_success_returns_photoid() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/upload/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<?xml version="1.0"?><rsp stat="ok"><photoid>9876</photoid></rsp>"#,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server).with_upload_url(format!("{}/upload/", server.uri()));
+        let id = client
+            .upload_photo("at", "ats", "Event20260101_000001.jpg", vec![1, 2, 3])
+            .await
+            .unwrap();
+        assert_eq!(id, "9876");
+    }
+
+    #[tokio::test]
+    async fn upload_photo_http_error_is_err_without_body_echo() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/upload/"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("secret internals"))
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server).with_upload_url(format!("{}/upload/", server.uri()));
+        let err = client
+            .upload_photo("at", "ats", "x.jpg", vec![0])
+            .await
+            .unwrap_err();
+        // upstream の body は log のみに出し、Err 文字列に echo しない
+        assert!(err.contains("flickr upload failed"));
+        assert!(!err.contains("secret internals"));
+    }
+
+    #[tokio::test]
+    async fn upload_photo_stat_fail_is_err() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/upload/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<rsp stat="fail"><err code="98" msg="Invalid auth token"/></rsp>"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let client = client_for(&server).with_upload_url(format!("{}/upload/", server.uri()));
+        let err = client
+            .upload_photo("at", "ats", "x.jpg", vec![0])
+            .await
+            .unwrap_err();
+        assert!(err.contains("photoid not found"));
     }
 
     #[tokio::test]

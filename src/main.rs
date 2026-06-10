@@ -1,3 +1,4 @@
+mod cam;
 mod db;
 mod error;
 mod flickr;
@@ -5,6 +6,7 @@ mod oauth1;
 mod routes;
 mod types;
 
+use cam::CamConfig;
 use flickr::{FlickrClient, FlickrConfig};
 use routes::AppState;
 
@@ -39,7 +41,12 @@ fn state_from_env() -> AppState {
         }
     };
 
-    AppState { pool, flickr }
+    let cam = CamConfig::from_env();
+    if cam.is_none() {
+        tracing::warn!("CAM_* not fully set — /sync will return 503");
+    }
+
+    AppState { pool, flickr, cam }
 }
 
 #[tokio::main]
@@ -54,6 +61,14 @@ async fn main() {
         println!("  FLICKR_CONSUMER_SECRET  Flickr OAuth consumer secret");
         println!("  FLICKR_CALLBACK_URL     OAuth callback URL");
         println!("  DATABASE_URL            Supabase PostgreSQL (rust-logi と共有)");
+        println!("  CAM_DIGEST_USER         camera digest auth user (POST /sync)");
+        println!("  CAM_DIGEST_PASS         camera digest auth password");
+        println!("  CAM_MACHINE_NAME        camera machine name");
+        println!("  CAM_SDCARD_CGI          camera SD-card listing CGI base URL");
+        println!("  CAM_MP4_CGI             camera mp4 download CGI base URL");
+        println!("  CAM_JPG_CGI             camera jpg download CGI base URL");
+        println!("  CAM_CF_ACCESS_CLIENT_ID     CF Access service token id (optional)");
+        println!("  CAM_CF_ACCESS_CLIENT_SECRET CF Access service token secret (optional)");
         return;
     }
 
