@@ -5,16 +5,17 @@ Cloud Run で稼働し、**scratch 極小イメージ** (musl static + rustls) �
 **Rust → TypeScript 型生成 (ts-rs)** を検証する。設計の全体像は
 [Issue #1](https://github.com/ippoan/rust-flickr/issues/1) を参照。
 
-## アーキテクチャ (目標)
+## アーキテクチャ
 
 ```
-[ front (nuxt) ]──REST──┐
-[ Cloud Scheduler ]──REST──┤
-                          ▼
-   [ edge Worker (REST proxy / auth / CORS) ]   ← CF API として公開
-                          ▼ fetch (+ GCP ID token)
-   [ rust-flickr (Cloud Run, axum, scratch 極小) ] ── Supabase / Flickr API
+[ front (nuxt) ]──REST──▶ [ cf-flickr-proxy (CF Worker) ] ──fetch──▶ [ rust-flickr (Cloud Run) ]
+[ Cloud Scheduler ]──────────────(Worker を経由せず直接)───────────▶ 同上 /import
 ```
+
+- edge Worker は [ippoan/cf-flickr-proxy](https://github.com/ippoan/cf-flickr-proxy)
+  (REST proxy / CORS、status 透過)。公開 URL: **https://flickr-proxy.mtamaramu.com**
+- Cloud Scheduler は Worker を経由せず Cloud Run `/import` を直接叩く
+  (ippoan/cf-flickr-proxy#1 の決定事項)
 
 ## エンドポイント
 
