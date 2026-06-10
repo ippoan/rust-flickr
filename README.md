@@ -21,7 +21,8 @@ Cloud Run で稼働し、**scratch 極小イメージ** (musl static + rustls) �
 
 | Method | Path | 状態 | 説明 |
 | --- | --- | --- | --- |
-| GET | `/healthz` | ✅ PR1 | 死活。`{status, service, version}` を返す |
+| GET | `/health` | ✅ | 死活。`{status, service, version}` を返す。**外形監視はこちらを使う** |
+| GET | `/healthz` | ✅ PR1 | `/health` と同一 handler。**run.app / ghs の Google フロントが `/healthz` をインターセプトして汎用 404 を返すため、外からは見えない** (コンテナ内 / GCP 内部経路用) |
 | GET | `/oauth/url` | ✅ PR2 | OAuth1.0a request token 取得 → 認可 URL 返却 |
 | POST | `/oauth/callback` | ✅ PR2 | verifier → access token 交換 + `flickr_tokens` UPSERT。token はレスポンスに echo しない (`{user_nsid, username, saved}`) |
 | POST | `/import` | ✅ PR3 | 未検証 `cam_files.flickr_id` を `flickr.photos.getInfo` で検証して `flickr_photo` 登録。body `{limit}` (省略時 500)。token 未登録は **412** |
