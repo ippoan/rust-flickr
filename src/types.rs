@@ -123,4 +123,8 @@ pub struct StatsResponse {
     pub total_unuploaded: i64,
     /// 全期間の flickr_photo 未登録残数
     pub total_unverified: i64,
+    /// 最古の未アップロード撮影日 (YYYYMMDD)。upload は古い順なので、
+    /// この値が日々進む = backfill が SD ローテーションに勝っている目印
+    #[ts(optional)]
+    pub oldest_unuploaded_date: Option<String>,
 }

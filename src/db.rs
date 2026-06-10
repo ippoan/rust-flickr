@@ -297,3 +297,12 @@ pub async fn count_total_unuploaded(conn: &mut PgConnection) -> Result<i64, ApiE
         .await?;
     Ok(count)
 }
+
+/// 最古の未アップロード撮影日 (backfill 進捗の可視化用、Refs #12)
+pub async fn oldest_unuploaded_date(conn: &mut PgConnection) -> Result<Option<String>, ApiError> {
+    let row: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT min(date) FROM cam_files WHERE flickr_id IS NULL")
+            .fetch_optional(conn)
+            .await?;
+    Ok(row.and_then(|(d,)| d))
+}
