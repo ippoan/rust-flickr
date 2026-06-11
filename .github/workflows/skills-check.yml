@@ -1,0 +1,18 @@
+name: skills-check
+
+# rust-flickr-map skill が src/ 等の構造変化に追従しているかを PR diff で検査する
+# (ci-workflows#118 / claude-skills#59 Wave 1)。enforce=warn (default) なので
+# 更新漏れは ::warning:: + Step Summary に出るだけで CI は緑のまま。
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  skills-check:
+    uses: ippoan/ci-workflows/.github/workflows/skills-check.yml@main
+    # with:
+    #   enforce: warn        # warn (default) | fail
