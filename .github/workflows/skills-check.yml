@@ -14,5 +14,6 @@ permissions:
 jobs:
   skills-check:
     uses: ippoan/ci-workflows/.github/workflows/skills-check.yml@main
-    # with:
-    #   enforce: warn        # warn (default) | fail
+    with:
+      # pilot (ci-workflows#118 PR3): map 更新漏れ / deprecated 依存追加で job fail
+      enforce: fail
