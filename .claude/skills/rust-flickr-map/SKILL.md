@@ -1,6 +1,6 @@
 ---
 name: rust-flickr-map
-generated-from: rust-flickr:c20310901a713c4d4d21c9104b5e2fca65e34dc7
+generated-from: rust-flickr:c8c1f240682bde590d0acc2ba4c35460963d9f5f
 paths: [src/, clients/, bindings/]
 description: ippoan/rust-flickr (Rust/axum on Cloud Run、カメラ→Flickr 写真パイプライン) の構造ナビゲーション + 運用 SoT。カメラ SD 巡回 (/sync)・OAuth1.0a (/oauth)・検証取り込み (/import)・日次集計 (/stats) の配置、実 org UUID、Cloud Scheduler 2 job、digest pin 手動 deploy、SD ローテーションと古い順 upload の競争、「黙って 200」禁止の設計原則を 1 枚にまとめる。トリガー:「rust-flickr」「Flickr 取り込み」「カメラ 写真 アップロード」「SyncCamFiles」「cam_files」「flickr_photo」「flickr_tokens」「/sync が」「flickr-proxy」「SD カード 巡回」「Digest 認証 カメラ」「upBySytem」等。
 ---
@@ -26,7 +26,7 @@ cf-billing-monitor (毎朝 06:00 JST) → GET /stats → メールレポート  
 
 - /sync: SD 巡回 (dates→hours→files XML) → cam_files UPSERT → 未 upload 分を**古い順**に Flickr へ (同期実行)
 - /import: cam_files.flickr_id 未検証分を photos.getInfo → flickr_photo 登録
-- /stats: 撮影日別 files/uploaded/verified + 残数 (daily mail が消費)
+- /stats: 撮影日別 files/uploaded/verified + 残数 (daily mail が消費)。`total_unuploaded` は **SD 実在範囲 (upload floor = `cam.list_dates` の min) 内のみ**数える (#18) — /sync の `remaining_unuploaded` と同じ floor 基準。cam 未設定/到達不能時だけ全期間 COUNT に fallback
 
 ## src 構成
 
@@ -47,8 +47,8 @@ cf-billing-monitor (毎朝 06:00 JST) → GET /stats → メールレポート  
 - **deploy は digest pin の手動** (MCP `deploy_service_from_image` / CI deploy-staging は STAGING_DEPLOY_ENABLED 無効で skip)。
   GHCR digest 取得→ secretKeyRef 構成ごとフル指定。env: FLICKR_*/DATABASE_URL/CAM_DIGEST_PASS = Secret Manager 参照、CAM_* その他 = plain
 - **upload は古い順 (ORDER BY name)、下限は SD 実在最古日** (#11) — 巡回再開位置を下限にすると backfill 後に過去分が漏れる
-- **/stats の oldest_unuploaded_date は全期間 min** — SD から消えた回収不能分 (2025 年〜) を指す。消化位置はレポート側が窓内導出 (cf-billing-monitor#8)
-- **3/21〜5/23 の ~2 万件は SD ローテーションで消失済み = 永遠に flickr_id NULL** (total_unuploaded の底)
+- **/stats の oldest_unuploaded_date (response field) は全期間 min のまま** — SD から消えた回収不能分 (2025 年〜) を指すので誤読注意。レポートは使わず消化位置を窓内導出 (cf-billing-monitor#8)。一方 `total_unuploaded` は #18 で floor 基準に変更済み (両者で基準が違う点に注意)
+- **3/21〜5/23 の ~2 万件は SD ローテーションで消失済み = 永遠に flickr_id NULL**。回収不能なので #18 で /stats の `total_unuploaded` は upload floor 以降だけ数えてこれを除外 (修正前は floor 無しの全期間 COUNT で「残数が減らない」と誤表示していた)
 - **tokio::spawn で background upload しない** — Cloud Run CPU throttling で完走しない (rust-logi 旧実装の罠、移植時に同期化)
 - 外形監視は **/health** (/healthz は Google フロントが食う — gcp-cloud-run-routing-traps skill 参照)
 - proxy (flickr-proxy.mtamaramu.com) 経由は **edge ~100s** で切られる。長い /sync は Cloud Run 直 or upload_limit 小さく
