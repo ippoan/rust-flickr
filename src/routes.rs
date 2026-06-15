@@ -479,11 +479,22 @@ async fn stats(
     let organization_id = require_organization(&headers)?;
     let days = query.days.unwrap_or(7).clamp(1, 60);
 
+    // 未アップロード残は SD に実在する範囲 (= upload floor 以降) だけを数える。
+    // SD ローテーションで消えた古い行は flickr_id NULL のまま残り回収不能なので、
+    // floor 無しの全期間 COUNT だと回収不能分まで残数に積み上がり「減らない」
+    // ように見える (/sync が remaining_unuploaded に使う floor と同じ基準に揃える)。
+    // floor は cam の日付一覧から導き、cam 未設定 / 到達不能時は全期間 COUNT に
+    // fallback する (= daily report をカメラ障害で落とさない)。
+    let upload_floor = stats_upload_floor(&state).await;
+
     let mut conn = pool.acquire().await.map_err(ApiError::from)?;
     db::set_current_organization(&mut conn, &organization_id).await?;
 
     let day_rows = db::day_stats(&mut conn, days).await?;
-    let total_unuploaded = db::count_total_unuploaded(&mut conn).await?;
+    let total_unuploaded = match upload_floor.as_deref() {
+        Some(floor) => db::count_unuploaded_cam_files(&mut conn, floor).await?,
+        None => db::count_total_unuploaded(&mut conn).await?,
+    };
     let total_unverified = db::count_unverified(&mut conn).await?;
     let oldest_unuploaded_date = db::oldest_unuploaded_date(&mut conn).await?;
 
@@ -501,6 +512,23 @@ async fn stats(
         total_unverified,
         oldest_unuploaded_date,
     }))
+}
+
+/// daily report (`GET /stats`) 用の upload floor (= SD カードに実在する最古日)。
+/// cam が未設定 or 日付一覧が取れない時は `None` を返し、呼び出し側は全期間
+/// COUNT に fallback する (= カメラ障害で daily report を止めない)。
+async fn stats_upload_floor(state: &AppState) -> Option<String> {
+    let cam_config = state.cam.as_ref()?;
+    match CamClient::new(cam_config.clone()).list_dates().await {
+        Ok(dates) => min_sd_date(&dates),
+        Err(e) => {
+            tracing::warn!(
+                ?e,
+                "stats: failed to list cam dates; counting all unuploaded"
+            );
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -807,6 +835,72 @@ mod tests {
         ];
         assert_eq!(min_sd_date(&dates), Some("20260524".to_string()));
         assert_eq!(min_sd_date(&[]), None);
+    }
+
+    #[tokio::test]
+    async fn stats_upload_floor_none_when_cam_unconfigured() {
+        // cam 未設定 → floor 無し → 呼び出し側は全期間 COUNT に fallback
+        let state = AppState {
+            pool: None,
+            flickr: None,
+            cam: None,
+        };
+        assert_eq!(stats_upload_floor(&state).await, None);
+    }
+
+    #[tokio::test]
+    async fn stats_upload_floor_returns_min_sd_date() {
+        use wiremock::matchers::header_exists;
+        let server = MockServer::start().await;
+        // Digest リトライ後 (Authorization 付き) は日付一覧を返す
+        Mock::given(method("GET"))
+            .and(path("/sd/cam1/Event"))
+            .and(header_exists("authorization"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    r#"<List><Dir name="20260610"/><Dir name="20260524"/></List>"#,
+                ),
+            )
+            .mount(&server)
+            .await;
+        // 初回 (Authorization 無し) は 401 Digest challenge
+        Mock::given(method("GET"))
+            .and(path("/sd/cam1/Event"))
+            .respond_with(ResponseTemplate::new(401).insert_header(
+                "www-authenticate",
+                r#"Digest realm="cam", nonce="abc123", qop="auth""#,
+            ))
+            .mount(&server)
+            .await;
+        let state = AppState {
+            pool: None,
+            flickr: None,
+            cam: Some(test_cam(&server)),
+        };
+        assert_eq!(
+            stats_upload_floor(&state).await,
+            Some("20260524".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn stats_upload_floor_none_on_cam_error() {
+        // Digest ではない 401 → Upstream error → floor 無し (warn して fallback)
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/sd/cam1/Event"))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .insert_header("www-authenticate", r#"Basic realm="cam""#),
+            )
+            .mount(&server)
+            .await;
+        let state = AppState {
+            pool: None,
+            flickr: None,
+            cam: Some(test_cam(&server)),
+        };
+        assert_eq!(stats_upload_floor(&state).await, None);
     }
 
     #[tokio::test]
