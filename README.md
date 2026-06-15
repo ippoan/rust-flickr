@@ -111,7 +111,7 @@ Job Summary に記録する。
 | `ci / fmt,clippy,test,build` | `ippoan/ci-workflows` の `rust-ci.yml` reusable |
 | `ts-bindings` | ts-rs 生成の `bindings/*.ts` が `src/types.rs` と一致するか (型ドリフト gate) |
 | `build-image` | musl static build → `FROM scratch` packaging → GHCR push (`ghcr.io/ippoan/rust-flickr`) |
-| `deploy-staging` | `cloud-run-deploy.yml` reusable で `rust-flickr-staging` へ digest-pinned deploy (WIF auth) |
+| `deploy-staging` | `cloud-run-deploy.yml` reusable で `rust-flickr-staging` へ digest-pinned に **CI auto-deploy** (WIF auth、非 draft PR ごと) |
 | `auto-merge` | 全 job green 後に squash auto-merge を queue |
 
 ### TypeScript 型 (ts-rs)
