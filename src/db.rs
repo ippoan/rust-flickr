@@ -251,6 +251,28 @@ pub async fn count_unuploaded_cam_files(
     Ok(count)
 }
 
+/// Flickr 未アップロードの残数 ((date, hour) 粒度 floor 版、Refs #24)。
+/// SD に実在する最古日付の途中 hour までしか残っていないケースで、その hour
+/// 未満の (= SD から既に消えた) 古い行が `count_unuploaded_cam_files` の日付
+/// 粒度 floor では除外できず「永久ゴースト」として残数に積まれ続ける問題の
+/// 修正。条件式は (date > floor_date) OR (date == floor_date AND hour >= floor_hour)。
+pub async fn count_unuploaded_cam_files_from(
+    conn: &mut PgConnection,
+    floor_date: &str,
+    floor_hour: &str,
+) -> Result<i64, ApiError> {
+    let (count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM cam_files \
+         WHERE flickr_id IS NULL \
+           AND (date > $1 OR (date = $1 AND hour >= $2))",
+    )
+    .bind(floor_date)
+    .bind(floor_hour)
+    .fetch_one(conn)
+    .await?;
+    Ok(count)
+}
+
 /// アップロード成功した flickr_id を記録
 pub async fn set_cam_file_flickr_id(
     conn: &mut PgConnection,
