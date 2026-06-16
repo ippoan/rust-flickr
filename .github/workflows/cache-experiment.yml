@@ -12,12 +12,13 @@ name: Cache Experiment
 #   - save-if は main 限定 (= PR では cache 保存しない)
 #   - cleanup は base 名で最新 1 世代だけ残す
 #
-# Step 2 (現在): cleanup を最新 3 世代保持に緩和 (KEEP_GENERATIONS=3)
-#   - shared-key / save-if は Step 1 から維持
-#   - PR で restore-key が main 最新だけでなく直近 3 世代から探せるようになり、
-#     exact match 率の向上を期待する
+# Step 2 (済): cleanup を最新 3 世代保持に緩和 (KEEP_GENERATIONS=3)
 #
-# Step 3 (予定、後続 PR): shared-key を `exp-test-shared` に統合 + save-if を main-warm 1 job 限定
+# Step 3 (現在): shared-key 統合 + 非対称 save-if
+#   - shared-key を `exp-test-shared` 1 個に統合 (a/b 共有)
+#   - cache-warm matrix を 1 job に畳んで、その 1 job だけ save-if: true で全 dep を save
+#   - test-matrix の 並列 2 job は save-if: false で read-only restore
+#     (並列 save 競合を回避しつつ、main warm の cache を共有 read する)
 
 on:
   pull_request:
@@ -49,38 +50,37 @@ env:
   RUSTC_WRAPPER: "sccache"
 
 jobs:
-  # main push 時のみ走らせる cache warmer。alc-api と同じ「shared-key 別 + save-if main 限定」構造。
+  # main push 時のみ走らせる cache warmer。
+  # Step 3: matrix を畳んで 1 job だけにし、その 1 job が a/b 両 test の dep を build → save する。
+  # save-if: true は main warm のここだけ。並列 save 競合の発生源を絶つ。
   cache-warm:
-    name: "Exp Warm (${{ matrix.target.name }})"
+    name: "Exp Warm (shared)"
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        target:
-          - { name: "a", key: "exp-test-a", cmd: "cargo test --test cache_experiment_a --no-run --locked" }
-          - { name: "b", key: "exp-test-b", cmd: "cargo test --test cache_experiment_b --no-run --locked" }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: mozilla-actions/sccache-action@v0.0.9
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: ${{ matrix.target.key }}
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Warm build
-        run: ${{ matrix.target.cmd }}
+          shared-key: exp-test-shared
+          save-if: 'true'  # main warm の 1 job だけが save する (非対称設計)
+      - name: Warm build (a + b 両方の dep を 1 つの target/ に揃える)
+        run: |
+          cargo test --test cache_experiment_a --no-run --locked
+          cargo test --test cache_experiment_b --no-run --locked
       - name: Report sccache stats
         run: |
           {
-            echo "## Warm (${{ matrix.target.name }}) — sccache stats"
+            echo "## Step 3 Warm (shared) — sccache stats"
             echo '```'
             sccache --show-stats
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # PR / main push の両方で走らせる PR と同じ matrix。
-  # sccache hit rate と rust-cache full match を計測する。
+  # PR / main push の両方で走らせる test 並列 matrix。
+  # Step 3: shared-key を 1 個に統合、ただし save-if: false で read-only restore のみ。
+  # main warm の 1 job が save した cache を 2 job が並列 read するため save 競合は起こらない。
   test-matrix:
     name: "Exp Test (${{ matrix.group.name }})"
     runs-on: ubuntu-latest
@@ -88,8 +88,8 @@ jobs:
       fail-fast: false
       matrix:
         group:
-          - { name: "a", key: "exp-test-a", cmd: "--test cache_experiment_a" }
-          - { name: "b", key: "exp-test-b", cmd: "--test cache_experiment_b" }
+          - { name: "a", cmd: "--test cache_experiment_a" }
+          - { name: "b", cmd: "--test cache_experiment_b" }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -97,14 +97,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         id: rust-cache
         with:
-          shared-key: ${{ matrix.group.key }}
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          shared-key: exp-test-shared
+          save-if: 'false'  # 並列 job からは絶対 save しない (Step 3 の肝)
       - name: Run test
         run: cargo test ${{ matrix.group.cmd }} --locked
       - name: Report sccache stats + cache hit
         run: |
           {
-            echo "## Step 2 (cleanup KEEP_GENERATIONS=3) — group ${{ matrix.group.name }}"
+            echo "## Step 3 (shared-key + 非対称 save-if) — group ${{ matrix.group.name }}"
             echo ""
             echo "### swatinem/rust-cache"
             echo "- cache hit: \`${{ steps.rust-cache.outputs.cache-hit }}\`"
@@ -115,8 +115,8 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # alc-api ci.yml L92-135 の cache-cleanup を縮約。
-  # base 名で最新 1 世代だけ残し他を削除する Step 1 baseline 挙動。
+  # alc-api ci.yml L92-135 の cache-cleanup を縮約。Step 2 で 3 世代保持に緩和済。
+  # Step 3 では shared-key が `exp-test-shared` 1 個に統合されているので、base 数も 1 個に減る。
   cache-cleanup:
     name: "Exp Cache Cleanup"
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
