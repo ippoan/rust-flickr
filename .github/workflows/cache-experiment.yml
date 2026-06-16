@@ -1,0 +1,161 @@
+name: Cache Experiment
+
+# CI cache 改善案を縮約 workflow で実測する実験台 (Refs #28)。
+#
+# 既存 `ci.yml` (= ippoan/ci-workflows の rust-ci.yml caller) は触らない。
+# このワークフローは required check ではなく observe-only で動かし、
+# sccache hit rate と swatinem/rust-cache の "full match: true/false" を
+# Job Summary に出して 3 step を比較する。
+#
+# Step 1 (現在): baseline
+#   - shared-key を `exp-test-a` / `exp-test-b` で別々に持つ (alc-api と同じ悪い構造を縮約再現)
+#   - save-if は main 限定 (= PR では cache 保存しない)
+#   - cleanup は base 名で最新 1 世代だけ残す
+#
+# Step 2 (予定、後続 commit): cleanup を最新 3 世代保持に緩和
+# Step 3 (予定、後続 commit): shared-key を `exp-test-shared` に統合 + save-if を main-warm 1 job 限定
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - '.github/workflows/cache-experiment.yml'
+      - 'tests/cache_experiment_*.rs'
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/cache-experiment.yml'
+      - 'tests/cache_experiment_*.rs'
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+
+permissions:
+  contents: read
+  # cache-cleanup 用 (gh cache delete)
+  actions: write
+
+env:
+  CARGO_TERM_COLOR: always
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: "sccache"
+
+jobs:
+  # main push 時のみ走らせる cache warmer。alc-api と同じ「shared-key 別 + save-if main 限定」構造。
+  cache-warm:
+    name: "Exp Warm (${{ matrix.target.name }})"
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - { name: "a", key: "exp-test-a", cmd: "cargo test --test cache_experiment_a --no-run --locked" }
+          - { name: "b", key: "exp-test-b", cmd: "cargo test --test cache_experiment_b --no-run --locked" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ matrix.target.key }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Warm build
+        run: ${{ matrix.target.cmd }}
+      - name: Report sccache stats
+        run: |
+          {
+            echo "## Warm (${{ matrix.target.name }}) — sccache stats"
+            echo '```'
+            sccache --show-stats
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # PR / main push の両方で走らせる PR と同じ matrix。
+  # sccache hit rate と rust-cache full match を計測する。
+  test-matrix:
+    name: "Exp Test (${{ matrix.group.name }})"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        group:
+          - { name: "a", key: "exp-test-a", cmd: "--test cache_experiment_a" }
+          - { name: "b", key: "exp-test-b", cmd: "--test cache_experiment_b" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mozilla-actions/sccache-action@v0.0.9
+      - uses: Swatinem/rust-cache@v2
+        id: rust-cache
+        with:
+          shared-key: ${{ matrix.group.key }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Run test
+        run: cargo test ${{ matrix.group.cmd }} --locked
+      - name: Report sccache stats + cache hit
+        run: |
+          {
+            echo "## Step 1 baseline — group ${{ matrix.group.name }}"
+            echo ""
+            echo "### swatinem/rust-cache"
+            echo "- cache hit: \`${{ steps.rust-cache.outputs.cache-hit }}\`"
+            echo ""
+            echo "### sccache --show-stats"
+            echo '```'
+            sccache --show-stats
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # alc-api ci.yml L92-135 の cache-cleanup を縮約。
+  # base 名で最新 1 世代だけ残し他を削除する Step 1 baseline 挙動。
+  cache-cleanup:
+    name: "Exp Cache Cleanup"
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs: [cache-warm]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Show current cache usage and prune stale
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          KEEP_GENERATIONS: '1'  # Step 1 baseline: 最新 1 世代
+        run: |
+          set -euo pipefail
+          echo "::group::Current cache usage"
+          gh cache list -R ${{ github.repository }} --sort size_in_bytes --order desc --limit 50 \
+            --json key,sizeInBytes --jq '.[] | "\(.sizeInBytes / 1048576 | floor)MB\t\(.key)"' || true
+          echo "::endgroup::"
+
+          echo "::group::Cleaning stale exp-* entries (keep latest $KEEP_GENERATIONS per base)"
+          gh cache list -R ${{ github.repository }} --limit 200 \
+            --json id,key,sizeInBytes,lastAccessedAt \
+            --jq '.[] | select(.key | startswith("v0-rust-exp-"))' | python3 - <<PY
+          import json, os, sys
+          keep = int(os.environ.get("KEEP_GENERATIONS", "1"))
+          entries = [json.loads(line) for line in sys.stdin if line.strip()]
+          groups = {}
+          for e in entries:
+              base = '-'.join(e['key'].rsplit('-', 1)[:-1])
+              groups.setdefault(base, []).append(e)
+          to_delete = []
+          for base, items in groups.items():
+              items.sort(key=lambda x: x['lastAccessedAt'], reverse=True)
+              to_delete.extend(items[keep:])
+          with open('/tmp/cache-ids.txt', 'w') as f:
+              for d in to_delete:
+                  print(f"Deleting {d['sizeInBytes']//1048576}MB {d['key']}")
+                  f.write(str(d['id']) + '\n')
+          print(f"Total: {len(to_delete)} stale entries (keep={keep})")
+          PY
+          if [ -s /tmp/cache-ids.txt ]; then
+            while read -r id; do
+              gh cache delete "$id" -R ${{ github.repository }} 2>/dev/null || true
+            done < /tmp/cache-ids.txt
+          fi
+          echo "::endgroup::"
