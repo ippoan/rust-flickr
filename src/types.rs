@@ -95,6 +95,9 @@ pub struct SyncResponse {
     pub uploaded_count: i32,
     /// アップロード失敗数 (個別失敗は処理継続、詳細は log)
     pub upload_errors: i32,
+    /// camera CGI が text/plain を返したため SD_ZOMBIE センチネルで
+    /// マークした件数 (= SD 上に実体が無くなった file の自動回収、Refs #26)
+    pub zombied_count: i32,
     /// flickr_id IS NULL で残っている件数 (次回 sync で続きから処理)
     pub remaining_unuploaded: i32,
     pub message: String,

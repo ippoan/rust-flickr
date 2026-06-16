@@ -33,6 +33,11 @@ uploaded_count: number,
  */
 upload_errors: number, 
 /**
+ * camera CGI が text/plain を返したため SD_ZOMBIE センチネルで
+ * マークした件数 (= SD 上に実体が無くなった file の自動回収、Refs #26)
+ */
+zombied_count: number, 
+/**
  * flickr_id IS NULL で残っている件数 (次回 sync で続きから処理)
  */
 remaining_unuploaded: number, message: string, };

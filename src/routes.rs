@@ -22,6 +22,18 @@ use crate::types::{
 
 pub const ORGANIZATION_HEADER: &str = "x-organization-id";
 
+/// camera CGI が text/plain (= SD 上に file が無い) を返した時に flickr_id に
+/// 打つセンチネル (Refs #26)。flickr 実 ID は数値文字列なので衝突しない
+pub const SD_ZOMBIE_SENTINEL: &str = "SD_ZOMBIE";
+
+/// `cam.download` の err string が「SD 上に file の実体が無い (CGI が text/plain
+/// のエラー応答を返した)」を示すかを判定する (Refs #26)。
+/// cam.rs の guard が出す `unexpected content type for ...: text/plain` 文言を
+/// suffix match することで、他の content-type (image/png 等) と取り違えない。
+fn is_sd_zombie_error(err: &str) -> bool {
+    err.contains("unexpected content type") && err.contains("text/plain")
+}
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Clone, Default)]
@@ -392,6 +404,7 @@ async fn sync_cam_files(
     let flickr_token_present = token.is_some();
     let mut uploaded_count = 0i32;
     let mut upload_errors = 0i32;
+    let mut zombied_count = 0i32;
 
     if upload_limit > 0 {
         match (state.flickr.as_ref(), token) {
@@ -433,8 +446,39 @@ async fn sync_cam_files(
                             }
                         }
                         Err(e) => {
-                            upload_errors += 1;
-                            tracing::warn!(name = file.name, error = e, "flickr upload failed");
+                            // CGI が text/plain を返したケース = SD 上に file の実体が
+                            // 無い (ローテで消えた zombie)。flickr_id='SD_ZOMBIE' を打って
+                            // 再試行ループから外す (Refs #26)。
+                            if is_sd_zombie_error(&e) {
+                                match db::set_cam_file_flickr_id(
+                                    &mut conn,
+                                    &file.name,
+                                    SD_ZOMBIE_SENTINEL,
+                                )
+                                .await
+                                {
+                                    Ok(()) => {
+                                        zombied_count += 1;
+                                        tracing::warn!(
+                                            name = file.name,
+                                            error = e,
+                                            "marked SD_ZOMBIE (camera returned text/plain)"
+                                        );
+                                    }
+                                    Err(db_err) => {
+                                        upload_errors += 1;
+                                        tracing::warn!(
+                                            name = file.name,
+                                            error = e,
+                                            ?db_err,
+                                            "failed to mark SD_ZOMBIE"
+                                        );
+                                    }
+                                }
+                            } else {
+                                upload_errors += 1;
+                                tracing::warn!(name = file.name, error = e, "flickr upload failed");
+                            }
                         }
                     }
                 }
@@ -454,7 +498,8 @@ async fn sync_cam_files(
 
     let message = format!(
         "Synced {processed_dates} dates, {processed_hours} hours, {new_files} files. \
-         Uploaded {uploaded_count} to Flickr ({upload_errors} errors, {remaining_unuploaded} remaining)."
+         Uploaded {uploaded_count} to Flickr ({upload_errors} errors, \
+         {zombied_count} SD-zombies marked, {remaining_unuploaded} remaining)."
     );
     tracing::info!(organization_id, message, "sync completed");
 
@@ -465,6 +510,7 @@ async fn sync_cam_files(
         flickr_token_present,
         uploaded_count,
         upload_errors,
+        zombied_count,
         remaining_unuploaded,
         message,
     }))
@@ -856,6 +902,32 @@ mod tests {
             cf_access_client_id: None,
             cf_access_client_secret: None,
         }
+    }
+
+    #[test]
+    fn is_sd_zombie_error_matches_only_text_plain_content_type() {
+        // cam.rs::download が出す実フォーマット (= 本番 log で観測した実値)
+        assert!(is_sd_zombie_error(
+            "unexpected content type for Event20260611_102850.jpg: text/plain"
+        ));
+        assert!(is_sd_zombie_error(
+            "unexpected content type for Event20260611_102854.mp4: text/plain"
+        ));
+
+        // 他の content-type は zombie 扱いしない (= 真の異常を握り潰さない)
+        assert!(!is_sd_zombie_error(
+            "unexpected content type for x.jpg: image/png"
+        ));
+        assert!(!is_sd_zombie_error(
+            "unexpected content type for x.jpg: text/html"
+        ));
+
+        // 関係ない error は false (flickr API 拒否 / 接続 error 等)
+        assert!(!is_sd_zombie_error("flickr api returned 5xx"));
+        assert!(!is_sd_zombie_error(
+            "failed to read x.jpg: connection closed"
+        ));
+        assert!(!is_sd_zombie_error(""));
     }
 
     #[test]
