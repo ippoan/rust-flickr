@@ -74,11 +74,17 @@ fn require_organization(headers: &HeaderMap) -> Result<String, ApiError> {
 /// remaining 11,643 件が一夜で 1,006 件に見えなくなった)。SD に実在する日付の
 /// 最小値を下限にすれば、SD から消えた古い行への無限再試行も避けられる
 fn min_sd_date(dates: &[String]) -> Option<String> {
-    dates
-        .iter()
-        .filter_map(|d| d.parse::<i64>().ok())
-        .min()
-        .map(|d| d.to_string())
+    min_sd_dir(dates)
+}
+
+/// 数値として最小の dir 名を、入力文字列のフォーマットを保ったまま返す
+/// (= "00" や "07" のような leading-zero hour 表記を `to_string()` で
+/// 潰さないため。日付 8 桁 / 時間 2 桁 のいずれにも使える共通実装)。
+fn min_sd_dir(dirs: &[String]) -> Option<String> {
+    dirs.iter()
+        .filter(|d| d.parse::<i64>().is_ok())
+        .min_by_key(|d| d.parse::<i64>().unwrap_or(i64::MAX))
+        .cloned()
 }
 
 pub fn app(state: AppState) -> Router {
@@ -483,7 +489,12 @@ async fn stats(
     // SD ローテーションで消えた古い行は flickr_id NULL のまま残り回収不能なので、
     // floor 無しの全期間 COUNT だと回収不能分まで残数に積み上がり「減らない」
     // ように見える (/sync が remaining_unuploaded に使う floor と同じ基準に揃える)。
-    // floor は cam の日付一覧から導き、cam 未設定 / 到達不能時は全期間 COUNT に
+    // floor は cam の (日付, 時間) 一覧から導く: 最古日付の最古時間まで絞ることで、
+    // 「最古日付の途中 hour までしか SD に残っていない」ケースで日付粒度 floor が
+    // 取りこぼす古い行 (= SD から消えた 永久ゴースト) を残数から除外する
+    // (Refs #19 floor 日付粒度 → #24 hour 粒度に拡張)。
+    // 日付は取れたが時間が取れない時は hour="00" に fallback (= 旧 #19 と同等動作、
+    // リグレッションなし)。cam 未設定 / 日付一覧 到達不能時は全期間 COUNT に
     // fallback する (= daily report をカメラ障害で落とさない)。
     let upload_floor = stats_upload_floor(&state).await;
 
@@ -491,8 +502,8 @@ async fn stats(
     db::set_current_organization(&mut conn, &organization_id).await?;
 
     let day_rows = db::day_stats(&mut conn, days).await?;
-    let total_unuploaded = match upload_floor.as_deref() {
-        Some(floor) => db::count_unuploaded_cam_files(&mut conn, floor).await?,
+    let total_unuploaded = match upload_floor.as_ref() {
+        Some((date, hour)) => db::count_unuploaded_cam_files_from(&mut conn, date, hour).await?,
         None => db::count_total_unuploaded(&mut conn).await?,
     };
     let total_unverified = db::count_unverified(&mut conn).await?;
@@ -514,21 +525,42 @@ async fn stats(
     }))
 }
 
-/// daily report (`GET /stats`) 用の upload floor (= SD カードに実在する最古日)。
-/// cam が未設定 or 日付一覧が取れない時は `None` を返し、呼び出し側は全期間
-/// COUNT に fallback する (= カメラ障害で daily report を止めない)。
-async fn stats_upload_floor(state: &AppState) -> Option<String> {
+/// daily report (`GET /stats`) 用の upload floor (= SD カードに実在する最古
+/// 日付の最古時間)。Refs #24: 旧 #19 では「日付」までしか絞らず、最古日付の
+/// 途中 hour 以降だけが SD に残るケースで、その日付の 00:00〜floor_hour 前の
+/// 行 (= SD ローテで消えた古い行) がゴーストとして count され続けた。本関数は
+/// (date, hour) tuple を返し、SQL 側で 2 段絞りする。
+/// 戻り値:
+/// - `Some((date, hour))`: 通常経路 (cam OK)
+/// - `None`: cam 未設定 / 日付一覧 到達不能 → 呼び出し側は全期間 COUNT に fallback
+/// - hour 一覧だけ取れない時は `(date, "00")` を返す (= 旧 #19 と同等の日付粒度
+///   floor で、リグレッションなし)
+async fn stats_upload_floor(state: &AppState) -> Option<(String, String)> {
     let cam_config = state.cam.as_ref()?;
-    match CamClient::new(cam_config.clone()).list_dates().await {
-        Ok(dates) => min_sd_date(&dates),
+    let client = CamClient::new(cam_config.clone());
+    let dates = match client.list_dates().await {
+        Ok(dates) => dates,
         Err(e) => {
             tracing::warn!(
                 ?e,
                 "stats: failed to list cam dates; counting all unuploaded"
             );
-            None
+            return None;
         }
-    }
+    };
+    let floor_date = min_sd_date(&dates)?;
+    let floor_hour = match client.list_hours(&floor_date).await {
+        Ok(hours) => min_sd_dir(&hours).unwrap_or_else(|| "00".to_string()),
+        Err(e) => {
+            tracing::warn!(
+                ?e,
+                date = %floor_date,
+                "stats: failed to list cam hours; falling back to date-only floor"
+            );
+            "00".to_string()
+        }
+    };
+    Some((floor_date, floor_hour))
 }
 
 #[cfg(test)]
@@ -837,6 +869,20 @@ mod tests {
         assert_eq!(min_sd_date(&[]), None);
     }
 
+    #[test]
+    fn min_sd_dir_preserves_leading_zero_format() {
+        // hour ディレクトリ ("00".."23") の最古を取る用途。"to_string()" で
+        // potential 0-padding を潰さず、cam が返した string 表現をそのまま返す
+        // (= SQL 側で cam_files.hour と等価比較するために必要)。
+        let hours = vec!["14".to_string(), "09".to_string(), "22".to_string()];
+        assert_eq!(min_sd_dir(&hours), Some("09".to_string()));
+
+        // junk 混入は skip、空 vec は None
+        let mixed = vec!["bad".to_string(), "07".to_string()];
+        assert_eq!(min_sd_dir(&mixed), Some("07".to_string()));
+        assert_eq!(min_sd_dir(&[]), None);
+    }
+
     #[tokio::test]
     async fn stats_upload_floor_none_when_cam_unconfigured() {
         // cam 未設定 → floor 無し → 呼び出し側は全期間 COUNT に fallback
@@ -849,10 +895,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stats_upload_floor_returns_min_sd_date() {
+    async fn stats_upload_floor_returns_min_sd_date_and_hour() {
         use wiremock::matchers::header_exists;
         let server = MockServer::start().await;
-        // Digest リトライ後 (Authorization 付き) は日付一覧を返す
+        // mount 順は specific (auth 必須) を先に — wiremock は最初にマッチした
+        // mock を返すので、catch-all (no auth) を先に置くと auth ありリトライも
+        // 401 で吸われてしまう。
         Mock::given(method("GET"))
             .and(path("/sd/cam1/Event"))
             .and(header_exists("authorization"))
@@ -863,12 +911,29 @@ mod tests {
             )
             .mount(&server)
             .await;
-        // 初回 (Authorization 無し) は 401 Digest challenge
         Mock::given(method("GET"))
             .and(path("/sd/cam1/Event"))
             .respond_with(ResponseTemplate::new(401).insert_header(
                 "www-authenticate",
                 r#"Digest realm="cam", nonce="abc123", qop="auth""#,
+            ))
+            .mount(&server)
+            .await;
+        // 最古日 20260524 の hour 一覧: 14, 09, 22 のうち 09 が最小。
+        // SD の最古 hour ディレクトリより前の (= ローテ済) 行を残数から除外できることを担保。
+        Mock::given(method("GET"))
+            .and(path("/sd/cam1/Event/20260524"))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<List><Dir name="14"/><Dir name="09"/><Dir name="22"/></List>"#,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/sd/cam1/Event/20260524"))
+            .respond_with(ResponseTemplate::new(401).insert_header(
+                "www-authenticate",
+                r#"Digest realm="cam", nonce="def456", qop="auth""#,
             ))
             .mount(&server)
             .await;
@@ -879,7 +944,94 @@ mod tests {
         };
         assert_eq!(
             stats_upload_floor(&state).await,
-            Some("20260524".to_string())
+            Some(("20260524".to_string(), "09".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn stats_upload_floor_falls_back_to_hour_zero_on_list_hours_error() {
+        // 日付は取れたが時間一覧で 5xx → hour="00" にフォールバック (=旧 #19 と
+        // 同等の日付粒度 floor、リグレッションなし)。
+        use wiremock::matchers::header_exists;
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/sd/cam1/Event"))
+            .and(header_exists("authorization"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"<List><Dir name="20260524"/></List>"#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/sd/cam1/Event"))
+            .respond_with(ResponseTemplate::new(401).insert_header(
+                "www-authenticate",
+                r#"Digest realm="cam", nonce="abc123", qop="auth""#,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/sd/cam1/Event/20260524"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let state = AppState {
+            pool: None,
+            flickr: None,
+            cam: Some(test_cam(&server)),
+        };
+        assert_eq!(
+            stats_upload_floor(&state).await,
+            Some(("20260524".to_string(), "00".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn stats_upload_floor_falls_back_to_hour_zero_on_empty_hours() {
+        // list_hours が空配列を返した時も hour="00" にフォールバック (= 日付
+        // ディレクトリは残っているが中身の hour が全消失したレアケース)。
+        use wiremock::matchers::header_exists;
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/sd/cam1/Event"))
+            .and(header_exists("authorization"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"<List><Dir name="20260524"/></List>"#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/sd/cam1/Event"))
+            .respond_with(ResponseTemplate::new(401).insert_header(
+                "www-authenticate",
+                r#"Digest realm="cam", nonce="abc123", qop="auth""#,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/sd/cam1/Event/20260524"))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"<List/>"#))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/sd/cam1/Event/20260524"))
+            .respond_with(ResponseTemplate::new(401).insert_header(
+                "www-authenticate",
+                r#"Digest realm="cam", nonce="def456", qop="auth""#,
+            ))
+            .mount(&server)
+            .await;
+        let state = AppState {
+            pool: None,
+            flickr: None,
+            cam: Some(test_cam(&server)),
+        };
+        assert_eq!(
+            stats_upload_floor(&state).await,
+            Some(("20260524".to_string(), "00".to_string()))
         );
     }
 
