@@ -137,9 +137,15 @@ jobs:
           echo "::endgroup::"
 
           echo "::group::Cleaning stale exp-* entries (keep latest $KEEP_GENERATIONS per base)"
+          # SIGPIPE 回避 (Refs #28): `gh cache list ... | python3 - <<PY` だと
+          # gh の stdout buffer flush と Python の stdin 読込タイミング次第で
+          # gh 側が SIGPIPE を食らい、set -o pipefail が exit 141 で fail させる
+          # (Step 1 / Step 3 main run で 2 回再現)。pipe を消して 2 段にする。
           gh cache list -R ${{ github.repository }} --limit 200 \
             --json id,key,sizeInBytes,lastAccessedAt \
-            --jq '.[] | select(.key | startswith("v0-rust-exp-"))' | python3 - <<PY
+            --jq '.[] | select(.key | startswith("v0-rust-exp-"))' \
+            > /tmp/exp-cache-entries.jsonl || true
+          python3 - < /tmp/exp-cache-entries.jsonl <<'PY'
           import json, os, sys
           keep = int(os.environ.get("KEEP_GENERATIONS", "1"))
           entries = [json.loads(line) for line in sys.stdin if line.strip()]
