@@ -192,7 +192,18 @@ jobs:
       # Secret 本体の投入は user の one-time setup (README「Secrets」参照)。
       # 未投入のまま deploy すると revision が起動失敗するため、投入完了までは
       # この 2 行を有効化しつつ secret が存在することが前提になる。
-      update_secrets: FLICKR_CONSUMER_KEY=rust-flickr-consumer-key:latest,FLICKR_CONSUMER_SECRET=rust-flickr-consumer-secret:latest,DATABASE_URL=rust-flickr-database-url:latest
+      #
+      # CAM_* も全て Secret Manager 参照にする (Refs #20)。rust-flickr は public repo
+      # なので、カメラの URL / machine name も plain env (set_env_vars) には置かず
+      # secret 化する。set_env_vars は --set-env-vars (= plain env を毎 deploy で完全
+      # リセット) なので、plain で置くと過去に手動投入した CAM_* が deploy ごとに
+      # 吹き飛ぶ (= state.cam=None → /sync が 503、/stats の total_unuploaded が
+      # upload floor を引けず全期間 COUNT に fallback し、daily mail の「未アップロード残」
+      # が SD ローテーション済みの古い行を数え続け減らない。#19 の floor が効かない)。
+      # update_secrets は --update-secrets (= additive) なので既存 binding は壊さない。
+      # カメラが CF Access 越しでない構成なら CAM_CF_ACCESS_CLIENT_ID / _SECRET の
+      # 2 entry を外す。
+      update_secrets: FLICKR_CONSUMER_KEY=rust-flickr-consumer-key:latest,FLICKR_CONSUMER_SECRET=rust-flickr-consumer-secret:latest,DATABASE_URL=rust-flickr-database-url:latest,CAM_DIGEST_USER=rust-flickr-cam-digest-user:latest,CAM_DIGEST_PASS=rust-flickr-cam-digest-pass:latest,CAM_MACHINE_NAME=rust-flickr-cam-machine-name:latest,CAM_SDCARD_CGI=rust-flickr-cam-sdcard-cgi:latest,CAM_MP4_CGI=rust-flickr-cam-mp4-cgi:latest,CAM_JPG_CGI=rust-flickr-cam-jpg-cgi:latest,CAM_CF_ACCESS_CLIENT_ID=rust-flickr-cam-cf-access-client-id:latest,CAM_CF_ACCESS_CLIENT_SECRET=rust-flickr-cam-cf-access-client-secret:latest
       set_env_vars: FLICKR_CALLBACK_URL=https://test.mtamaramu.com/flickr/callback
 
   # 全 CI job が success / skipped した時だけ auto-merge を enable する

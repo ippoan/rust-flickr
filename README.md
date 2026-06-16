@@ -49,8 +49,8 @@ upload は**古い順** (`ORDER BY name`) で SD カードのローテーショ�
 | --- | --- | --- |
 | `PORT` | - | listen port (default 8080、Cloud Run が注入) |
 | `FLICKR_CONSUMER_KEY` / `FLICKR_CONSUMER_SECRET` | boot 時 optional | 未設定なら `/oauth/*` が 503 を返す (PR5 で Secret Manager 配線) |
-| `CAM_DIGEST_USER` / `CAM_DIGEST_PASS` / `CAM_MACHINE_NAME` / `CAM_SDCARD_CGI` / `CAM_MP4_CGI` / `CAM_JPG_CGI` | boot 時 optional | 未設定なら `/sync` が 503 を返す。rust-logi と同名 (= Cloud Run の値を流用可)。digest 資格情報と CF Access token は Secret Manager 参照、URL / machine name は plain env |
-| `CAM_CF_ACCESS_CLIENT_ID` / `CAM_CF_ACCESS_CLIENT_SECRET` | optional | カメラが CF Access 越しの場合の Service Token |
+| `CAM_DIGEST_USER` / `CAM_DIGEST_PASS` / `CAM_MACHINE_NAME` / `CAM_SDCARD_CGI` / `CAM_MP4_CGI` / `CAM_JPG_CGI` | boot 時 optional | 1 つでも欠けると `CamConfig::from_env()` が `None` を返し (全 env を `.ok()?` で要求)、`/sync` が 503 / `/stats` の `total_unuploaded` が upload floor を引けず全期間 COUNT に fallback する。rust-logi と同名 (= Cloud Run の値を流用可)。**rust-flickr は public repo なので URL / machine name も含め全て Secret Manager 参照** (Refs #20) |
+| `CAM_CF_ACCESS_CLIENT_ID` / `CAM_CF_ACCESS_CLIENT_SECRET` | optional | カメラが CF Access 越しの場合の Service Token。これも Secret Manager 参照 (CF Access 不要な構成なら未投入で可) |
 | `FLICKR_CALLBACK_URL` | - | OAuth callback URL |
 | `DATABASE_URL` | boot 時 optional | rust-logi と共有の Supabase。未設定なら DB 系 endpoint が 503 |
 
@@ -168,8 +168,19 @@ gcloud run deploy rust-flickr-staging \
 | `FLICKR_CONSUMER_KEY` | `rust-flickr-consumer-key` |
 | `FLICKR_CONSUMER_SECRET` | `rust-flickr-consumer-secret` |
 | `DATABASE_URL` | `rust-flickr-database-url` |
+| `CAM_DIGEST_USER` | `rust-flickr-cam-digest-user` |
+| `CAM_DIGEST_PASS` | `rust-flickr-cam-digest-pass` |
+| `CAM_MACHINE_NAME` | `rust-flickr-cam-machine-name` |
+| `CAM_SDCARD_CGI` | `rust-flickr-cam-sdcard-cgi` |
+| `CAM_MP4_CGI` | `rust-flickr-cam-mp4-cgi` |
+| `CAM_JPG_CGI` | `rust-flickr-cam-jpg-cgi` |
+| `CAM_CF_ACCESS_CLIENT_ID` (任意) | `rust-flickr-cam-cf-access-client-id` |
+| `CAM_CF_ACCESS_CLIENT_SECRET` (任意) | `rust-flickr-cam-cf-access-client-secret` |
 
-`FLICKR_CALLBACK_URL` は非 secret なので plain env (`set_env_vars`)。
+`FLICKR_CALLBACK_URL` は非 secret なので plain env (`set_env_vars`)。`CAM_*` は
+**public repo に URL / machine name を出さない**ため全て Secret Manager 参照にする
+(Refs #20)。カメラが CF Access 越しでない構成なら `CAM_CF_ACCESS_*` の 2 secret は
+未投入のままにし、`ci.yml` の `update_secrets` からも該当 2 entry を外す。
 
 投入は rust-logi の Cloud Run env (平文) から値をコピーする。値を画面に出さずに
 移送する one-shot (Cloud Shell):
@@ -187,13 +198,27 @@ get_env() {
 get_env FLICKR_CONSUMER_KEY    | gcloud secrets create rust-flickr-consumer-key    --project "$PROJECT" --replication-policy=automatic --data-file=-
 get_env FLICKR_CONSUMER_SECRET | gcloud secrets create rust-flickr-consumer-secret --project "$PROJECT" --replication-policy=automatic --data-file=-
 get_env DATABASE_URL           | gcloud secrets create rust-flickr-database-url    --project "$PROJECT" --replication-policy=automatic --data-file=-
+
+# CAM_* (Refs #20)。rust-flickr-cam-digest-pass が既存なら 409 になるので skip でよい。
+# カメラが CF Access 越しでない構成なら最後の 2 行 (cf-access-*) を省略する。
+get_env CAM_DIGEST_USER  | gcloud secrets create rust-flickr-cam-digest-user  --project "$PROJECT" --replication-policy=automatic --data-file=-
+get_env CAM_DIGEST_PASS  | gcloud secrets create rust-flickr-cam-digest-pass  --project "$PROJECT" --replication-policy=automatic --data-file=-
+get_env CAM_MACHINE_NAME | gcloud secrets create rust-flickr-cam-machine-name --project "$PROJECT" --replication-policy=automatic --data-file=-
+get_env CAM_SDCARD_CGI   | gcloud secrets create rust-flickr-cam-sdcard-cgi   --project "$PROJECT" --replication-policy=automatic --data-file=-
+get_env CAM_MP4_CGI      | gcloud secrets create rust-flickr-cam-mp4-cgi      --project "$PROJECT" --replication-policy=automatic --data-file=-
+get_env CAM_JPG_CGI      | gcloud secrets create rust-flickr-cam-jpg-cgi      --project "$PROJECT" --replication-policy=automatic --data-file=-
+get_env CAM_CF_ACCESS_CLIENT_ID     | gcloud secrets create rust-flickr-cam-cf-access-client-id     --project "$PROJECT" --replication-policy=automatic --data-file=-
+get_env CAM_CF_ACCESS_CLIENT_SECRET | gcloud secrets create rust-flickr-cam-cf-access-client-secret --project "$PROJECT" --replication-policy=automatic --data-file=-
 ```
 
 runtime SA (default compute SA) には project-wide の `secretmanager.secretAccessor`
 が付与済み (rust-alc-api と同じ)。専用 SA に切り替える場合は per-secret IAM を付ける。
 
 > **注意**: secret 未投入のまま `deploy-staging` が走ると `secretKeyRef` 解決に失敗して
-> revision 作成がエラーになる。**先に上記 3 secret を投入**してから merge すること。
+> revision 作成がエラーになる。**先に上記 secret を全て投入**してから merge すること。
+> とくに `CAM_*` は 1 つでも欠けると `CamConfig::from_env()` が `None` を返し、`/sync`
+> が 503 / `/stats` が floor を引けず全期間 COUNT に fallback する (= #19 / #20 の修正
+> が効かない)。
 
 ### 計測 (PR1 の検証項目)
 
