@@ -122,7 +122,8 @@ front は [`clients/ts/client.ts`](./clients/ts/client.ts) (typed fetch ラッ�
 `bindings/` をコピー or 参照して使う。
 
 `deploy-staging` は repo variable **`STAGING_DEPLOY_ENABLED=true`** を設定するまで
-skip される。下記 one-time setup 完了後に variable を入れた瞬間 deploy が動き始める。
+skip される。下記 one-time setup 完了後に variable を入れた瞬間 deploy が動き始める
+(Settings → Secrets and variables → Actions → Variables で設定、一度立てれば永続)。
 
 ### One-time setup (user 手動)
 
