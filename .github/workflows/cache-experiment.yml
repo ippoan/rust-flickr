@@ -7,13 +7,17 @@ name: Cache Experiment
 # sccache hit rate と swatinem/rust-cache の "full match: true/false" を
 # Job Summary に出して 3 step を比較する。
 #
-# Step 1 (現在): baseline
+# Step 1 (済): baseline
 #   - shared-key を `exp-test-a` / `exp-test-b` で別々に持つ (alc-api と同じ悪い構造を縮約再現)
 #   - save-if は main 限定 (= PR では cache 保存しない)
 #   - cleanup は base 名で最新 1 世代だけ残す
 #
-# Step 2 (予定、後続 commit): cleanup を最新 3 世代保持に緩和
-# Step 3 (予定、後続 commit): shared-key を `exp-test-shared` に統合 + save-if を main-warm 1 job 限定
+# Step 2 (現在): cleanup を最新 3 世代保持に緩和 (KEEP_GENERATIONS=3)
+#   - shared-key / save-if は Step 1 から維持
+#   - PR で restore-key が main 最新だけでなく直近 3 世代から探せるようになり、
+#     exact match 率の向上を期待する
+#
+# Step 3 (予定、後続 PR): shared-key を `exp-test-shared` に統合 + save-if を main-warm 1 job 限定
 
 on:
   pull_request:
@@ -100,7 +104,7 @@ jobs:
       - name: Report sccache stats + cache hit
         run: |
           {
-            echo "## Step 1 baseline — group ${{ matrix.group.name }}"
+            echo "## Step 2 (cleanup KEEP_GENERATIONS=3) — group ${{ matrix.group.name }}"
             echo ""
             echo "### swatinem/rust-cache"
             echo "- cache hit: \`${{ steps.rust-cache.outputs.cache-hit }}\`"
@@ -124,7 +128,7 @@ jobs:
       - name: Show current cache usage and prune stale
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          KEEP_GENERATIONS: '1'  # Step 1 baseline: 最新 1 世代
+          KEEP_GENERATIONS: '3'  # Step 2: 最新 3 世代に緩和
         run: |
           set -euo pipefail
           echo "::group::Current cache usage"
