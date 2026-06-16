@@ -201,9 +201,10 @@ jobs:
       # upload floor を引けず全期間 COUNT に fallback し、daily mail の「未アップロード残」
       # が SD ローテーション済みの古い行を数え続け減らない。#19 の floor が効かない)。
       # update_secrets は --update-secrets (= additive) なので既存 binding は壊さない。
-      # カメラが CF Access 越しでない構成なら CAM_CF_ACCESS_CLIENT_ID / _SECRET の
-      # 2 entry を外す。
-      update_secrets: FLICKR_CONSUMER_KEY=rust-flickr-consumer-key:latest,FLICKR_CONSUMER_SECRET=rust-flickr-consumer-secret:latest,DATABASE_URL=rust-flickr-database-url:latest,CAM_DIGEST_USER=rust-flickr-cam-digest-user:latest,CAM_DIGEST_PASS=rust-flickr-cam-digest-pass:latest,CAM_MACHINE_NAME=rust-flickr-cam-machine-name:latest,CAM_SDCARD_CGI=rust-flickr-cam-sdcard-cgi:latest,CAM_MP4_CGI=rust-flickr-cam-mp4-cgi:latest,CAM_JPG_CGI=rust-flickr-cam-jpg-cgi:latest,CAM_CF_ACCESS_CLIENT_ID=rust-flickr-cam-cf-access-client-id:latest,CAM_CF_ACCESS_CLIENT_SECRET=rust-flickr-cam-cf-access-client-secret:latest
+      # カメラは CF Access 越しではない (rust-logi の env にも CAM_CF_ACCESS_* は無い)
+      # ため CAM_CF_ACCESS_CLIENT_ID / _SECRET の 2 entry は配線しない。CF Access
+      # 越しの構成になった場合は 2 entry を末尾に追加 + 該当 secret を投入する。
+      update_secrets: FLICKR_CONSUMER_KEY=rust-flickr-consumer-key:latest,FLICKR_CONSUMER_SECRET=rust-flickr-consumer-secret:latest,DATABASE_URL=rust-flickr-database-url:latest,CAM_DIGEST_USER=rust-flickr-cam-digest-user:latest,CAM_DIGEST_PASS=rust-flickr-cam-digest-pass:latest,CAM_MACHINE_NAME=rust-flickr-cam-machine-name:latest,CAM_SDCARD_CGI=rust-flickr-cam-sdcard-cgi:latest,CAM_MP4_CGI=rust-flickr-cam-mp4-cgi:latest,CAM_JPG_CGI=rust-flickr-cam-jpg-cgi:latest
       set_env_vars: FLICKR_CALLBACK_URL=https://test.mtamaramu.com/flickr/callback
 
   # 全 CI job が success / skipped した時だけ auto-merge を enable する

@@ -174,13 +174,14 @@ gcloud run deploy rust-flickr-staging \
 | `CAM_SDCARD_CGI` | `rust-flickr-cam-sdcard-cgi` |
 | `CAM_MP4_CGI` | `rust-flickr-cam-mp4-cgi` |
 | `CAM_JPG_CGI` | `rust-flickr-cam-jpg-cgi` |
-| `CAM_CF_ACCESS_CLIENT_ID` (任意) | `rust-flickr-cam-cf-access-client-id` |
-| `CAM_CF_ACCESS_CLIENT_SECRET` (任意) | `rust-flickr-cam-cf-access-client-secret` |
 
 `FLICKR_CALLBACK_URL` は非 secret なので plain env (`set_env_vars`)。`CAM_*` は
 **public repo に URL / machine name を出さない**ため全て Secret Manager 参照にする
-(Refs #20)。カメラが CF Access 越しでない構成なら `CAM_CF_ACCESS_*` の 2 secret は
-未投入のままにし、`ci.yml` の `update_secrets` からも該当 2 entry を外す。
+(Refs #20)。**カメラは CF Access 越しではない** (rust-logi の env にも
+`CAM_CF_ACCESS_*` は無い) ため `CAM_CF_ACCESS_CLIENT_ID` / `_SECRET` は配線していない。
+CF Access 越しの構成になった場合は `rust-flickr-cam-cf-access-client-id` /
+`rust-flickr-cam-cf-access-client-secret` を投入し、`ci.yml` の `update_secrets`
+末尾に 2 entry を追加する。
 
 投入は rust-logi の Cloud Run env (平文) から値をコピーする。値を画面に出さずに
 移送する one-shot (Cloud Shell):
@@ -200,15 +201,14 @@ get_env FLICKR_CONSUMER_SECRET | gcloud secrets create rust-flickr-consumer-secr
 get_env DATABASE_URL           | gcloud secrets create rust-flickr-database-url    --project "$PROJECT" --replication-policy=automatic --data-file=-
 
 # CAM_* (Refs #20)。rust-flickr-cam-digest-pass が既存なら 409 になるので skip でよい。
-# カメラが CF Access 越しでない構成なら最後の 2 行 (cf-access-*) を省略する。
+# カメラは CF Access 越しではないため CAM_CF_ACCESS_* は不要 (ci.yml の update_secrets
+# にも配線していない)。CF Access 越しの構成になった場合のみ末尾に 2 行追加。
 get_env CAM_DIGEST_USER  | gcloud secrets create rust-flickr-cam-digest-user  --project "$PROJECT" --replication-policy=automatic --data-file=-
 get_env CAM_DIGEST_PASS  | gcloud secrets create rust-flickr-cam-digest-pass  --project "$PROJECT" --replication-policy=automatic --data-file=-
 get_env CAM_MACHINE_NAME | gcloud secrets create rust-flickr-cam-machine-name --project "$PROJECT" --replication-policy=automatic --data-file=-
 get_env CAM_SDCARD_CGI   | gcloud secrets create rust-flickr-cam-sdcard-cgi   --project "$PROJECT" --replication-policy=automatic --data-file=-
 get_env CAM_MP4_CGI      | gcloud secrets create rust-flickr-cam-mp4-cgi      --project "$PROJECT" --replication-policy=automatic --data-file=-
 get_env CAM_JPG_CGI      | gcloud secrets create rust-flickr-cam-jpg-cgi      --project "$PROJECT" --replication-policy=automatic --data-file=-
-get_env CAM_CF_ACCESS_CLIENT_ID     | gcloud secrets create rust-flickr-cam-cf-access-client-id     --project "$PROJECT" --replication-policy=automatic --data-file=-
-get_env CAM_CF_ACCESS_CLIENT_SECRET | gcloud secrets create rust-flickr-cam-cf-access-client-secret --project "$PROJECT" --replication-policy=automatic --data-file=-
 ```
 
 runtime SA (default compute SA) には project-wide の `secretmanager.secretAccessor`
