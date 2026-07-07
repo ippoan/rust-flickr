@@ -58,3 +58,37 @@ cf-billing-monitor (毎朝 06:00 JST) → GET /stats → メールレポート  
 - edge: ippoan/cf-flickr-proxy (cf-flickr-proxy-map)
 - daily mail: ippoan/cf-billing-monitor `src/flickr-report.ts` (/trigger-flickr で手動送信)
 - 旧実装の原本: yhonda-ohishi-pub-dev/rust-logi `src/services/cam_files_service.rs` (public、tarball で読める)
+
+## CLAUDE.md から移設 (2026-07-07)
+
+## Worktree / branch 命名規則
+
+形式: `<issue-number>-<type>-<short-description>`
+
+- `issue-number`: 必須。先に issue を立ててから branch を作る
+- `type`: `feat` | `fix` | `refactor` | `infra`
+
+Claude Code が自動採番する `claude/...` で実装に入る場合は、対応する issue を
+紐付けた上で PR description に `Refs #N` を明記する。
+
+## 環境
+
+`secrets-inventory-gcp` / `release-wave-gcp` に揃えて **staging を実運用環境**とする。
+
+| env | Cloud Run service | trigger |
+|---|---|---|
+| staging (live = 実運用) | `rust-flickr-staging` | PR (non-draft) |
+| production | `rust-flickr` | `v*` tag push (当面未使用) |
+
+**staging 反映 = 本番反映**。PR を上げると staging に auto-deploy されるため、
+壊れた変更を PR に積まない (CI gate が green になってから deploy job が走る)。
+
+## CI / デプロイ
+
+- CI (`.github/workflows/ci.yml`) は `ippoan/ci-workflows` の `rust-ci.yml`
+  (fmt/clippy/test/build) + `build-image` (musl + scratch + GHCR push) +
+  `deploy-staging` (`cloud-run-deploy.yml`、WIF) + `auto-merge`
+  (`auto-merge.yml`、全 job green 後に squash auto-merge を queue) で構成。
+- `deploy-staging` は repo variable `STAGING_DEPLOY_ENABLED=true` まで skip
+  (one-time GCP setup の手順は README 参照)。
+- `coverage_100.toml` を repo root に置くと rust-ci の 100% gate が自動で有効化される。
